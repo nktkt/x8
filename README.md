@@ -246,7 +246,7 @@ deliverables, open questions, and risks for each milestone.
 | **v1.1** ✅ | Async I/O | `fetch`, timers, `Promise`, microtasks |
 | **v1.2** ✅ | TypeScript | TS/JSX via oxc, type stripping |
 | **v1.3** ✅ | Modules | ES modules, dynamic import, HTTP imports |
-| **v1.4** | Concurrency | Web Workers, `MessageChannel` |
+| **v1.4** ✅ | Concurrency | Workers on dedicated threads |
 | **v1.5** | Permissions | Deno-style allow/deny flags |
 | **v1.6** | Embedding | Stable Rust API, WASI plugins |
 | **v2.0** | Production | Optional V8 backend, snapshots, `x8 compile` |

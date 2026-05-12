@@ -123,27 +123,33 @@ The minimum viable JavaScript runtime.
 
 ---
 
-## v1.4.0 — Concurrency and workers
+## v1.4.0 — Concurrency and workers ✅
 
-**Theme:** Use multiple cores without leaving the runtime.
+**Status:** Released.
 
-### Deliverables
+### Delivered
 
-- [ ] **Web Workers** API — spawn a worker from a script URL, get a
-      `Worker` instance with `postMessage` / `onmessage`
-- [ ] **`MessageChannel`** and **`BroadcastChannel`**
-- [ ] **`structuredClone`** for cross-worker data transfer
-- [ ] **`SharedArrayBuffer`** and `Atomics` (Boa support permitting)
-- [ ] Each worker runs in its own `tokio` runtime on a dedicated
-      thread
-- [ ] CPU-bound `Promise.all` actually parallelizes across cores when
-      operands are worker calls
+- [x] **`Worker(scriptPath)`** spawns a script on a dedicated OS
+      thread with its own Boa context and tokio runtime
+- [x] **`worker.postMessage(str)`** / **`worker.onmessage = fn`** for
+      bidirectional messaging
+- [x] **`self.postMessage(str)`** / **`self.onmessage = fn`** inside
+      worker scripts
+- [x] **`worker.terminate()`** to stop a worker explicitly
+- [x] **`worker.onerror = fn`** for runtime errors from workers
+- [x] Worker scripts can `import` modules and use `fetch`,
+      independently of the main thread
 
-### Risks
+### Deferred
 
-- Boa is not currently thread-safe across `Context` instances. We
-  will need one `Context` per worker, which is the natural design but
-  has implications for shared object identity.
+- `new Worker(...)` constructor form — currently call without `new`
+  (Boa native constructor wiring is non-trivial). Functionally
+  equivalent.
+- Structured cloning — currently messages are strings only. Pass
+  `JSON.stringify(obj)` and `JSON.parse(msg)` to send objects.
+- `MessageChannel`, `BroadcastChannel`, `SharedArrayBuffer`, `Atomics`
+  — v2.x
+- Parallel `Promise.all` over fetches (still sequential `block_on`)
 
 ---
 

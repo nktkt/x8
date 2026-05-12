@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
+
 
 use boa_engine::{
     builtins::promise::PromiseState,
@@ -19,7 +22,7 @@ use boa_engine::{
     module::{Module, ModuleLoader, Referrer},
     object::{builtins::{JsArray, JsFunction, JsPromise}, ObjectInitializer},
     property::Attribute,
-    Context, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source,
+    Context, JsError, JsNativeError, JsObject, JsResult, JsString, JsValue, NativeFunction, Source,
 };
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -59,6 +62,8 @@ impl JobQueue for AsyncJobQueue {
 
     fn run_jobs(&self, context: &mut Context) {
         loop {
+            let mut did_work = false;
+
             // Drain all pending sync jobs first.
             loop {
                 let job = self.promise_jobs.borrow_mut().pop_front();
@@ -71,14 +76,56 @@ impl JobQueue for AsyncJobQueue {
                     None => break,
                 }
             }
+
             // Drain pending futures.
-            let futures: Vec<FutureJob> = std::mem::take(&mut *self.future_jobs.borrow_mut());
-            if futures.is_empty() {
+            let futures: Vec<FutureJob> =
+                std::mem::take(&mut *self.future_jobs.borrow_mut());
+            if !futures.is_empty() {
+                did_work = true;
+                for fut in futures {
+                    let job = self.rt.block_on(fut);
+                    self.promise_jobs.borrow_mut().push_back(job);
+                }
+            }
+
+            // Drain worker events (non-blocking).
+            let drained: Vec<WorkerEvent> = WORKER_EVENTS_RX.with(|rx| {
+                let mut out = Vec::new();
+                if let Some(rx) = rx.borrow().as_ref() {
+                    while let Ok(ev) = rx.try_recv() {
+                        out.push(ev);
+                    }
+                }
+                out
+            });
+            if !drained.is_empty() {
+                for event in drained {
+                    if let Err(e) = handle_worker_event(event, context) {
+                        eprintln!("Uncaught (in worker handler): {e}");
+                    }
+                }
+                continue;
+            }
+
+            if did_work {
+                continue;
+            }
+
+            // No more work. If there are still active workers, block on the event channel.
+            let any_workers = WORKERS.with(|w| !w.borrow().is_empty());
+            if !any_workers {
                 break;
             }
-            for fut in futures {
-                let job = self.rt.block_on(fut);
-                self.promise_jobs.borrow_mut().push_back(job);
+            let event = WORKER_EVENTS_RX.with(|rx| {
+                rx.borrow().as_ref().and_then(|r| r.recv().ok())
+            });
+            match event {
+                Some(event) => {
+                    if let Err(e) = handle_worker_event(event, context) {
+                        eprintln!("Uncaught (in worker handler): {e}");
+                    }
+                }
+                None => break,
             }
         }
     }
@@ -401,7 +448,7 @@ fn clear_timeout_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     Ok(JsValue::undefined())
 }
 
-fn schedule_interval(id: u32, cb: boa_engine::JsObject, ms: u64, ctx: &mut Context) {
+fn schedule_interval(id: u32, cb: JsObject, ms: u64, ctx: &mut Context) {
     let cb_for_job = cb.clone();
     let cb_for_reschedule = cb;
     let future: FutureJob = Box::pin(async move {
@@ -679,6 +726,350 @@ fn fetch_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
 }
 
 // ============================================================================
+// Workers (basic threaded ES module workers with string messaging)
+// ============================================================================
+
+enum WorkerCmd {
+    Message(String),
+    Terminate,
+}
+
+enum WorkerEvent {
+    Message { worker_id: u32, data: String },
+    Error { worker_id: u32, message: String },
+    Done { worker_id: u32 },
+}
+
+struct WorkerHandle {
+    sender: mpsc::Sender<WorkerCmd>,
+    js_obj: JsObject,
+}
+
+thread_local! {
+    static WORKERS: RefCell<HashMap<u32, WorkerHandle>> = RefCell::new(HashMap::new());
+    static WORKER_EVENTS_TX: RefCell<Option<mpsc::Sender<WorkerEvent>>> = const { RefCell::new(None) };
+    static WORKER_EVENTS_RX: RefCell<Option<mpsc::Receiver<WorkerEvent>>> = const { RefCell::new(None) };
+    static IS_WORKER: RefCell<Option<(u32, mpsc::Sender<WorkerEvent>)>> = const { RefCell::new(None) };
+}
+
+static NEXT_WORKER_ID: AtomicU32 = AtomicU32::new(1);
+
+fn init_worker_events() {
+    let (tx, rx) = mpsc::channel();
+    WORKER_EVENTS_TX.with(|c| *c.borrow_mut() = Some(tx));
+    WORKER_EVENTS_RX.with(|c| *c.borrow_mut() = Some(rx));
+}
+
+fn main_event_sender() -> mpsc::Sender<WorkerEvent> {
+    WORKER_EVENTS_TX.with(|c| {
+        c.borrow()
+            .as_ref()
+            .expect("worker events not initialized")
+            .clone()
+    })
+}
+
+fn worker_post_message_native(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let this_obj = this
+        .as_object()
+        .ok_or_else(|| js_err("Worker.postMessage: invalid this"))?;
+    let id_val = this_obj.get(js_string!("_id"), ctx)?;
+    let id = id_val.to_u32(ctx).unwrap_or(0);
+    let data = args
+        .first()
+        .ok_or_else(|| js_err("Worker.postMessage: missing message"))?
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let sender = WORKERS.with(|w| w.borrow().get(&id).map(|h| h.sender.clone()));
+    match sender {
+        Some(s) => s
+            .send(WorkerCmd::Message(data))
+            .map_err(|e| js_err(format!("postMessage: {e}")))?,
+        None => return Err(js_err(format!("Worker {id} has terminated"))),
+    }
+    Ok(JsValue::undefined())
+}
+
+fn worker_terminate_native(
+    this: &JsValue,
+    _: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let this_obj = this
+        .as_object()
+        .ok_or_else(|| js_err("Worker.terminate: invalid this"))?;
+    let id_val = this_obj.get(js_string!("_id"), ctx)?;
+    let id = id_val.to_u32(ctx).unwrap_or(0);
+    let sender = WORKERS.with(|w| w.borrow_mut().remove(&id).map(|h| h.sender));
+    if let Some(s) = sender {
+        let _ = s.send(WorkerCmd::Terminate);
+    }
+    Ok(JsValue::undefined())
+}
+
+fn worker_self_post_message_native(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let data = args
+        .first()
+        .ok_or_else(|| js_err("self.postMessage: missing message"))?
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let (id, tx) = IS_WORKER.with(|c| {
+        c.borrow()
+            .clone()
+            .expect("self.postMessage called outside worker")
+    });
+    let _ = tx.send(WorkerEvent::Message {
+        worker_id: id,
+        data,
+    });
+    Ok(JsValue::undefined())
+}
+
+fn worker_main(
+    id: u32,
+    path: PathBuf,
+    cmd_rx: mpsc::Receiver<WorkerCmd>,
+    event_tx: mpsc::Sender<WorkerEvent>,
+) {
+    // Tokio runtime + Boa context for this worker.
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = event_tx.send(WorkerEvent::Error {
+                worker_id: id,
+                message: format!("worker {id}: tokio init failed: {e}"),
+            });
+            let _ = event_tx.send(WorkerEvent::Done { worker_id: id });
+            return;
+        }
+    };
+    let job_queue = Rc::new(AsyncJobQueue::new(rt));
+    install_queue(job_queue.clone());
+
+    let module_loader = Rc::new(X8ModuleLoader::new());
+
+    let mut ctx = match Context::builder()
+        .job_queue(job_queue)
+        .module_loader(module_loader)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = event_tx.send(WorkerEvent::Error {
+                worker_id: id,
+                message: format!("worker {id}: context build: {e}"),
+            });
+            let _ = event_tx.send(WorkerEvent::Done { worker_id: id });
+            return;
+        }
+    };
+
+    // Mark this thread as a worker.
+    IS_WORKER.with(|c| *c.borrow_mut() = Some((id, event_tx.clone())));
+
+    // Set up worker globals.
+    if let Err(e) = register_globals(&mut ctx, &[]) {
+        let _ = event_tx.send(WorkerEvent::Error {
+            worker_id: id,
+            message: format!("worker {id}: globals init: {e}"),
+        });
+        let _ = event_tx.send(WorkerEvent::Done { worker_id: id });
+        return;
+    }
+
+    // Build `self` object with postMessage; onmessage is set by JS.
+    let self_obj = ObjectInitializer::new(&mut ctx)
+        .function(
+            NativeFunction::from_fn_ptr(worker_self_post_message_native),
+            js_string!("postMessage"),
+            1,
+        )
+        .property(
+            js_string!("onmessage"),
+            JsValue::null(),
+            Attribute::all(),
+        )
+        .build();
+    let _ = ctx.register_global_property(js_string!("self"), self_obj.clone(), Attribute::all());
+
+    // Load and evaluate the worker script.
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = event_tx.send(WorkerEvent::Error {
+                worker_id: id,
+                message: format!("worker {id}: read {}: {e}", path.display()),
+            });
+            let _ = event_tx.send(WorkerEvent::Done { worker_id: id });
+            return;
+        }
+    };
+    let source = if is_typescript_path(&path) {
+        match transpile(&raw, &path) {
+            Ok(js) => js,
+            Err(e) => {
+                let _ = event_tx.send(WorkerEvent::Error {
+                    worker_id: id,
+                    message: format!("worker {id}: transpile: {e}"),
+                });
+                let _ = event_tx.send(WorkerEvent::Done { worker_id: id });
+                return;
+            }
+        }
+    } else {
+        raw
+    };
+
+    if is_module_path(&path) {
+        let module = match Module::parse(
+            Source::from_bytes(source.as_bytes()).with_path(&path),
+            None,
+            &mut ctx,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = event_tx.send(WorkerEvent::Error {
+                    worker_id: id,
+                    message: format!("worker {id}: parse: {e}"),
+                });
+                let _ = event_tx.send(WorkerEvent::Done { worker_id: id });
+                return;
+            }
+        };
+        let p = module.load_link_evaluate(&mut ctx);
+        queue().run_jobs(&mut ctx);
+        if let PromiseState::Rejected(reason) = p.state() {
+            let s = reason
+                .to_string(&mut ctx)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            let _ = event_tx.send(WorkerEvent::Error {
+                worker_id: id,
+                message: format!("worker {id}: {s}"),
+            });
+        }
+    } else if let Err(e) = ctx.eval(Source::from_bytes(source.as_bytes())) {
+        let _ = event_tx.send(WorkerEvent::Error {
+            worker_id: id,
+            message: format!("worker {id}: {e}"),
+        });
+    }
+
+    // Message loop.
+    while let Ok(cmd) = cmd_rx.recv() {
+        match cmd {
+            WorkerCmd::Terminate => break,
+            WorkerCmd::Message(data) => {
+                let onmessage = match self_obj.get(js_string!("onmessage"), &mut ctx) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(callable) = onmessage.as_callable() {
+                    let msg = JsValue::from(JsString::from(data.as_str()));
+                    let _ = callable.call(
+                        &JsValue::from(self_obj.clone()),
+                        &[msg],
+                        &mut ctx,
+                    );
+                    queue().run_jobs(&mut ctx);
+                }
+            }
+        }
+    }
+
+    let _ = event_tx.send(WorkerEvent::Done { worker_id: id });
+}
+
+fn new_worker_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let path_str = args
+        .first()
+        .ok_or_else(|| js_err("Worker: missing path"))?
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let path = PathBuf::from(&path_str);
+
+    let id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let event_tx = main_event_sender();
+
+    let worker_obj = ObjectInitializer::new(ctx)
+        .property(js_string!("_id"), JsValue::from(id), Attribute::all())
+        .property(js_string!("onmessage"), JsValue::null(), Attribute::all())
+        .property(js_string!("onerror"), JsValue::null(), Attribute::all())
+        .function(
+            NativeFunction::from_fn_ptr(worker_post_message_native),
+            js_string!("postMessage"),
+            1,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(worker_terminate_native),
+            js_string!("terminate"),
+            0,
+        )
+        .build();
+
+    WORKERS.with(|w| {
+        w.borrow_mut().insert(
+            id,
+            WorkerHandle {
+                sender: cmd_tx,
+                js_obj: worker_obj.clone(),
+            },
+        );
+    });
+
+    thread::spawn(move || worker_main(id, path, cmd_rx, event_tx));
+
+    Ok(JsValue::from(worker_obj))
+}
+
+fn handle_worker_event(event: WorkerEvent, ctx: &mut Context) -> JsResult<JsValue> {
+    match event {
+        WorkerEvent::Message { worker_id, data } => {
+            let obj = WORKERS.with(|w| w.borrow().get(&worker_id).map(|h| h.js_obj.clone()));
+            if let Some(obj) = obj {
+                let onmessage = obj.get(js_string!("onmessage"), ctx)?;
+                if let Some(callable) = onmessage.as_callable() {
+                    let msg = JsValue::from(JsString::from(data.as_str()));
+                    callable.call(&JsValue::from(obj), &[msg], ctx)?;
+                }
+            }
+        }
+        WorkerEvent::Error { worker_id, message } => {
+            let obj = WORKERS.with(|w| w.borrow().get(&worker_id).map(|h| h.js_obj.clone()));
+            if let Some(obj) = obj {
+                let onerror = obj.get(js_string!("onerror"), ctx)?;
+                if let Some(callable) = onerror.as_callable() {
+                    let msg = JsValue::from(JsString::from(message.as_str()));
+                    callable.call(&JsValue::from(obj), &[msg], ctx)?;
+                } else {
+                    eprintln!("{NAME}: {message}");
+                }
+            } else {
+                eprintln!("{NAME}: {message}");
+            }
+        }
+        WorkerEvent::Done { worker_id } => {
+            WORKERS.with(|w| {
+                w.borrow_mut().remove(&worker_id);
+            });
+        }
+    }
+    Ok(JsValue::undefined())
+}
+
+// ============================================================================
 // Register globals
 // ============================================================================
 
@@ -734,6 +1125,7 @@ fn register_globals(ctx: &mut Context, script_args: &[String]) -> JsResult<()> {
     reg!("clearInterval", 1, clear_interval_native);
     reg!("queueMicrotask", 1, queue_microtask_native);
     reg!("fetch", 1, fetch_native);
+    reg!("Worker", 1, new_worker_native);
 
     // args
     let arr = JsArray::new(ctx);
@@ -1013,6 +1405,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    init_worker_events();
     let job_queue = Rc::new(AsyncJobQueue::new(rt));
     install_queue(job_queue.clone());
 
