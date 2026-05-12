@@ -158,6 +158,34 @@ if (args.length === 0) {
 console.log(`Hello, ${args[0]}!`);
 ```
 
+## TypeScript and JSX
+
+Files with `.ts`, `.tsx`, `.jsx`, `.mts`, or `.cts` extensions are
+automatically transpiled with [oxc](https://oxc.rs) before execution.
+
+```sh
+x8 script.ts        # types stripped, then run
+x8 component.jsx    # JSX transformed, then run
+```
+
+**JSX** uses the classic runtime with `h` as the element factory and
+`Fragment` as the fragment tag. You must define them yourself:
+
+```js
+const h = (tag, props, ...children) => ({ tag, props: props || {}, children });
+const Fragment = "Fragment";
+
+const tree = <div className="x">hello <span>world</span></div>;
+console.log(tree);
+```
+
+**Limitations** (in v1.2):
+
+- No type checking — types are stripped, not verified. Use `tsc
+  --noEmit` for type validation.
+- No source maps yet (runtime errors point at transpiled JS).
+- No `import` resolution — modules land in v1.3.
+
 ## Language support
 
 x8 inherits its JavaScript support from the Boa engine, which targets
@@ -182,7 +210,7 @@ deliverables, open questions, and risks for each milestone.
 |---|---|---|
 | **v1.0** ✅ | Initial release | Script/eval/REPL, console, fs, args |
 | **v1.1** ✅ | Async I/O | `fetch`, timers, `Promise`, microtasks |
-| **v1.2** | TypeScript | TS/JSX via SWC, source maps |
+| **v1.2** ✅ | TypeScript | TS/JSX via oxc, type stripping |
 | **v1.3** | Modules | ES modules, HTTP imports, lockfile |
 | **v1.4** | Concurrency | Web Workers, `MessageChannel` |
 | **v1.5** | Permissions | Deno-style allow/deny flags |

@@ -74,31 +74,27 @@ The minimum viable JavaScript runtime.
 
 ---
 
-## v1.2.0 — TypeScript and JSX
+## v1.2.0 — TypeScript and JSX ✅
 
-**Theme:** Run modern source code without a separate toolchain.
+**Status:** Released.
 
-### Deliverables
+### Delivered
 
-- [ ] **TypeScript** transpilation via `swc_ecma_parser` +
-      `swc_ecma_transforms_typescript`
-- [ ] **JSX/TSX** transformation (classic and automatic runtimes)
-- [ ] Auto-detect based on file extension: `.ts`, `.tsx`, `.jsx`, `.mjs`,
-      `.cjs`
-- [ ] **Type stripping only** in v1.2 (no type checking). Type
-      checking is a v2.x topic.
-- [ ] **Source maps** for accurate error stack traces
-- [ ] `--check` flag that reports parse errors without executing
+- [x] **TypeScript** transpilation via [oxc](https://oxc.rs) (chosen
+      over SWC for smaller dep tree and faster builds)
+- [x] **JSX/TSX** transformation in classic mode with configurable
+      pragma (`h` / `Fragment` by default)
+- [x] Auto-detect based on file extension: `.ts`, `.tsx`, `.jsx`,
+      `.mts`, `.cts`
+- [x] **Type stripping** — interfaces, type aliases, generics, return
+      types, parameter annotations
+- [x] **Enums and classes** with private fields work
 
-### Non-goals
+### Deferred to later versions
 
-- We will **not** ship a type checker. Run `tsc --noEmit` for that.
-  Reproducing `tsc` is out of scope for this runtime.
-
-### Risks
-
-- SWC is a large dependency. We will gate it behind a `typescript`
-  Cargo feature so the default build stays lean.
+- Source maps for error stack traces — v2.0
+- `--check` flag for type-checking — explicit non-goal
+- Automatic JSX runtime (requires module support) — v1.3
 
 ---
 

@@ -637,13 +637,72 @@ fn run_source(source: &str, label: &str, ctx: &mut Context) -> ExitCode {
     }
 }
 
+fn is_typescript_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("ts" | "tsx" | "jsx" | "mts" | "cts")
+    )
+}
+
+fn transpile(source: &str, path: &Path) -> Result<String, String> {
+    use oxc_allocator::Allocator;
+    use oxc_codegen::Codegen;
+    use oxc_parser::Parser;
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+    use oxc_transformer::{TransformOptions, Transformer};
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| {
+        SourceType::default()
+            .with_typescript(true)
+            .with_module(true)
+    });
+    let parser_ret = Parser::new(&allocator, source, source_type).parse();
+    if !parser_ret.errors.is_empty() {
+        let msg: Vec<String> = parser_ret.errors.iter().map(|e| e.to_string()).collect();
+        return Err(msg.join("\n"));
+    }
+    let mut program = parser_ret.program;
+
+    let semantic_ret = SemanticBuilder::new().with_enum_eval(true).build(&program);
+    if !semantic_ret.errors.is_empty() {
+        let msg: Vec<String> = semantic_ret.errors.iter().map(|e| e.to_string()).collect();
+        return Err(msg.join("\n"));
+    }
+    let scoping = semantic_ret.semantic.into_scoping();
+
+    let mut options = TransformOptions::default();
+    options.jsx.runtime = oxc_transformer::JsxRuntime::Classic;
+    options.jsx.pragma = Some("h".to_string());
+    options.jsx.pragma_frag = Some("Fragment".to_string());
+    let transformer_ret = Transformer::new(&allocator, path, &options)
+        .build_with_scoping(scoping, &mut program);
+    if !transformer_ret.errors.is_empty() {
+        let msg: Vec<String> = transformer_ret.errors.iter().map(|e| e.to_string()).collect();
+        return Err(msg.join("\n"));
+    }
+    Ok(Codegen::new().build(&program).code)
+}
+
 fn run_file(path: &Path, ctx: &mut Context) -> ExitCode {
-    let source = match fs::read_to_string(path) {
+    let raw = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{NAME}: cannot read {}: {e}", path.display());
             return ExitCode::from(1);
         }
+    };
+    let source = if is_typescript_path(path) {
+        match transpile(&raw, path) {
+            Ok(js) => js,
+            Err(e) => {
+                eprintln!("{NAME}: {}: transpile error\n{e}", path.display());
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        raw
     };
     run_source(&source, &path.display().to_string(), ctx)
 }
