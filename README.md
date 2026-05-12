@@ -248,7 +248,7 @@ deliverables, open questions, and risks for each milestone.
 | **v1.3** ✅ | Modules | ES modules, dynamic import, HTTP imports |
 | **v1.4** ✅ | Concurrency | Workers on dedicated threads |
 | **v1.5** ✅ | Permissions | Allow/deny flags, inherited by workers |
-| **v1.6** | Embedding | Stable Rust API, WASI plugins |
+| **v1.6** ✅ | Embedding | lib/bin split, `x8::run_cli`, public `Permissions` |
 | **v2.0** | Production | Optional V8 backend, snapshots, `x8 compile` |
 
 ## Architecture

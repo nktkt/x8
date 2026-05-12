@@ -1,6 +1,6 @@
 [package]
 name = "x8"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 description = "A minimal, fast JavaScript runtime written in Rust"
 license = "MIT"
@@ -8,6 +8,10 @@ repository = "https://github.com/nktkt/x8"
 readme = "README.md"
 keywords = ["javascript", "runtime", "js", "interpreter"]
 categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "x8"
+path = "src/lib.rs"
 
 [[bin]]
 name = "x8"

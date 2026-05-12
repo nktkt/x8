@@ -180,19 +180,27 @@ The minimum viable JavaScript runtime.
 
 ---
 
-## v1.6.0 — Embedding and FFI
+## v1.6.0 — Embedding and FFI ✅
 
-**Theme:** x8 as a Rust library.
+**Status:** Released.
 
-### Deliverables
+### Delivered
 
-- [ ] Stable public Rust API (`x8::Runtime`, `x8::Module`, …)
-- [ ] Crate published to crates.io as `x8-runtime`
-- [ ] **Native bindings**: register Rust functions/structs as JS
-      globals from outside the crate (today this requires forking)
-- [ ] **WASI plugins**: load WASM modules as scriptable extensions —
-      a safer alternative to FFI for sandboxed plugin systems
-- [ ] Documentation site with examples
+- [x] Split crate into a `lib` + `bin` layout
+- [x] `pub fn x8::run_cli(args: Vec<String>) -> ExitCode` for
+      embedding the CLI behavior
+- [x] Public `x8::Permissions` struct with `all_allowed()` /
+      `all_denied()` constructors
+- [x] Public API documented with rustdoc examples
+
+### Deferred to v2.0+
+
+- A higher-level `x8::Runtime` with structured `eval()` returning
+  serializable values
+- Crate published to crates.io (needs an API token to release)
+- Native bindings for registering Rust functions as JS globals from
+  outside the crate
+- WASI plugins
 
 ---
 
