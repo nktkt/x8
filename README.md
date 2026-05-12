@@ -303,6 +303,7 @@ deliverables, open questions, and risks for each milestone.
 | **v1.5** ✅ | Permissions | Allow/deny flags, inherited by workers |
 | **v1.6** ✅ | Embedding | lib/bin split, `x8::run_cli`, public `Permissions` |
 | **v2.0** ✅ | Production | Default-deny perms, `x8 test`, `x8 fmt` |
+| **v2.1** ✅ | Distribution | `x8 compile`, GitHub Actions release, examples, benchmarks |
 
 ## Architecture
 
@@ -330,16 +331,36 @@ Native built-ins are registered as `NativeFunction` callables on the
 global object. Each function shells out to `std::fs` / `std::process`
 directly — there is no async event loop in v1.0.
 
+## Documentation
+
+- **[ROADMAP.md](./ROADMAP.md)** — milestone plan and deferred items
+- **[CHANGELOG.md](./CHANGELOG.md)** — version-by-version history
+- **[FAQ.md](./FAQ.md)** — common questions about positioning, speed, npm, etc.
+- **[BENCHMARKS.md](./BENCHMARKS.md)** — honest CPU benchmarks vs Node/Bun
+- **[docs/COMPARE.md](./docs/COMPARE.md)** — feature matrix vs Node/Deno/Bun
+- **[examples/](./examples/)** — runnable scripts demonstrating each feature
+- **[benchmarks/](./benchmarks/)** — cross-runtime micro-benchmarks
+- **[CONTRIBUTING.md](./CONTRIBUTING.md)** — how to contribute
+- **[SECURITY.md](./SECURITY.md)** — vulnerability disclosure policy
+
+## Pre-built binaries
+
+GitHub Actions builds release artifacts on each tag push for:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+- `x86_64-pc-windows-msvc`
+
+Grab the appropriate archive from the
+[Releases page](https://github.com/nktkt/x8/releases).
+
 ## Contributing
 
-Issues and pull requests are welcome. Please open an issue first for
-larger changes so we can discuss the design.
-
-When submitting a PR:
-
-1. `cargo fmt` your code.
-2. `cargo clippy --all-targets` should pass without warnings.
-3. Add tests under `tests/` if your change is observable.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, code style, and PR
+process. Open an issue first for larger changes so we can discuss the
+design.
 
 ## License
 

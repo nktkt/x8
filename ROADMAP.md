@@ -228,11 +228,34 @@ milestones can pick them up:
 
 - Optional V8 backend behind `--features v8` (large undertaking)
 - Snapshots for sub-millisecond cold start (depends on Boa snapshots)
-- Single-file binaries via `x8 compile` (à la Bun) — requires a
-  self-extracting binary format
-- Pre-built release binaries on GitHub Releases (needs CI setup)
 - Crates.io publication (needs API token)
 - Source maps for v1.2 transpilation
+
+---
+
+## v2.1.0 — Examples, CI, single-binary compile, benchmarks ✅
+
+**Status:** Released.
+
+### Delivered
+
+- [x] **`x8 compile SCRIPT -o OUTPUT`** — appends transpiled JS plus
+      a magic trailer to the host x8 binary; the resulting binary
+      detects the embedded script on startup and runs it with all
+      permissions allowed
+- [x] **GitHub Actions release workflow** building x86_64/aarch64 for
+      Linux, macOS (Intel + Apple Silicon), and x86_64 for Windows on
+      every `v*` tag push; assets uploaded to the GitHub Release
+- [x] **CI workflow** (build + smoke tests + fmt/clippy lint) on
+      every push / PR to `main`
+- [x] **[`examples/`](../examples/)** — runnable scripts for hello,
+      fetch, modules, workers, tests
+- [x] **[`benchmarks/`](../benchmarks/)** + **BENCHMARKS.md** — honest
+      cross-runtime micro-benchmarks (x8 is ~30–340x slower than V8
+      runtimes on CPU-bound work)
+- [x] CHANGELOG.md, CONTRIBUTING.md, SECURITY.md, FAQ.md,
+      docs/COMPARE.md
+- [x] GitHub issue + PR templates
 
 ---
 

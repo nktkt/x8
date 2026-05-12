@@ -408,6 +408,7 @@ fn print_help() {
     println!("    x8 [OPTIONS] [SCRIPT] [-- ARGS...]");
     println!("    x8 [OPTIONS] test [PATHS...]");
     println!("    x8 [OPTIONS] fmt [--write] [PATHS...]");
+    println!("    x8 compile SCRIPT -o OUTPUT");
     println!();
     println!("OPTIONS:");
     println!("    -e, --eval <CODE>    Evaluate inline JavaScript and exit");
@@ -1432,6 +1433,165 @@ fn run_repl(ctx: &mut Context) -> ExitCode {
 }
 
 // ============================================================================
+// Compiled binary support: `x8 compile script.ts -o myapp`
+//
+// Layout appended after the host `x8` binary:
+//
+//     [ source bytes ][ source_len: u64 LE ][ MAGIC: 16 bytes ]
+//
+// On startup we read the last 24 bytes. If the trailing 16 match
+// MAGIC, the binary was produced by `x8 compile` and we run the
+// embedded script directly instead of behaving as a CLI.
+// ============================================================================
+
+const COMPILE_MAGIC: &[u8; 16] = b"\x00X8COMPILEDv01\x00\x00";
+
+fn detect_embedded_script() -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let exe = env::current_exe().ok()?;
+    let mut f = fs::File::open(&exe).ok()?;
+    let size = f.metadata().ok()?.len();
+    if size < 24 {
+        return None;
+    }
+    f.seek(SeekFrom::End(-24)).ok()?;
+    let mut tail = [0u8; 24];
+    f.read_exact(&mut tail).ok()?;
+    if &tail[8..24] != COMPILE_MAGIC {
+        return None;
+    }
+    let len_bytes: [u8; 8] = tail[0..8].try_into().ok()?;
+    let script_len = u64::from_le_bytes(len_bytes);
+    if script_len == 0 || script_len + 24 > size {
+        return None;
+    }
+    f.seek(SeekFrom::End(-(24 + script_len as i64))).ok()?;
+    let mut buf = vec![0u8; script_len as usize];
+    f.read_exact(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
+fn cmd_compile(input: &str, output: &str) -> ExitCode {
+    use std::io::Write;
+
+    let input_path = Path::new(input);
+    let output_path = Path::new(output);
+
+    let raw = match fs::read_to_string(input_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{NAME}: compile: read {}: {e}", input_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let js = if is_typescript_path(input_path) {
+        match transpile(&raw, input_path) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("{NAME}: compile: transpile {}: {e}", input_path.display());
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        raw
+    };
+
+    let exe = match env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{NAME}: compile: cannot locate current executable: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Refuse to compile from an already-compiled binary; we'd embed twice.
+    if detect_embedded_script().is_some() {
+        eprintln!(
+            "{NAME}: compile: the running x8 already has an embedded script. \
+             Run from a pristine `x8` binary (e.g. one built from source)."
+        );
+        return ExitCode::from(1);
+    }
+
+    if let Err(e) = fs::copy(&exe, output_path) {
+        eprintln!("{NAME}: compile: copy host binary to {}: {e}", output_path.display());
+        return ExitCode::from(1);
+    }
+
+    let mut f = match fs::OpenOptions::new().append(true).open(output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{NAME}: compile: open {}: {e}", output_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let bytes = js.as_bytes();
+    let len = bytes.len() as u64;
+    let res = (|| -> std::io::Result<()> {
+        f.write_all(bytes)?;
+        f.write_all(&len.to_le_bytes())?;
+        f.write_all(COMPILE_MAGIC)?;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        eprintln!("{NAME}: compile: write {}: {e}", output_path.display());
+        return ExitCode::from(1);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(mut perms) = fs::metadata(output_path).map(|m| m.permissions()) {
+            perms.set_mode(0o755);
+            let _ = fs::set_permissions(output_path, perms);
+        }
+    }
+
+    println!(
+        "{NAME}: compile: wrote {} ({} bytes embedded)",
+        output_path.display(),
+        len
+    );
+    ExitCode::SUCCESS
+}
+
+fn run_embedded(source: String, script_args: Vec<String>) -> ExitCode {
+    // Compiled binaries are user-authored; trust them by default.
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("{NAME}: embedded: tokio init failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    install_permissions(Permissions::all_allowed());
+    init_worker_events();
+    let job_queue = Rc::new(AsyncJobQueue::new(rt));
+    install_queue(job_queue.clone());
+    let module_loader = Rc::new(X8ModuleLoader::new());
+    let mut ctx = match Context::builder()
+        .job_queue(job_queue)
+        .module_loader(module_loader)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{NAME}: embedded: context build: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = register_globals(&mut ctx, &script_args) {
+        eprintln!("{NAME}: embedded: globals init: {e}");
+        return ExitCode::from(1);
+    }
+    run_source(&source, "[embedded]", &mut ctx)
+}
+
+// ============================================================================
 // Subcommands: `x8 test` and `x8 fmt`
 // ============================================================================
 
@@ -1655,6 +1815,7 @@ fn cmd_test(paths: Vec<String>, ctx: &mut Context) -> ExitCode {
 enum Subcommand {
     Test { paths: Vec<String> },
     Fmt { paths: Vec<String>, write: bool },
+    Compile { input: String, output: String },
 }
 
 #[derive(Default)]
@@ -1701,6 +1862,43 @@ fn parse_args(argv: Vec<String>) -> ParsedArgs {
                 out.subcommand = Some(Subcommand::Test { paths });
                 break;
             }
+            "compile" if out.subcommand.is_none() && out.script.is_none() => {
+                let mut input: Option<String> = None;
+                let mut output: Option<String> = None;
+                while let Some(a) = iter.next() {
+                    match a.as_str() {
+                        "-o" | "--output" => {
+                            output = iter.next();
+                        }
+                        s if s.starts_with('-') && s != "-" => {
+                            out.error = Some(format!("compile: unknown option: {s}"));
+                            return out;
+                        }
+                        _ => {
+                            if input.is_none() {
+                                input = Some(a);
+                            } else {
+                                out.error = Some("compile: only one input script supported".into());
+                                return out;
+                            }
+                        }
+                    }
+                }
+                match (input, output) {
+                    (Some(i), Some(o)) => {
+                        out.subcommand = Some(Subcommand::Compile { input: i, output: o });
+                    }
+                    (None, _) => {
+                        out.error = Some("compile: missing input script".into());
+                        return out;
+                    }
+                    (_, None) => {
+                        out.error = Some("compile: missing --output (or -o) target".into());
+                        return out;
+                    }
+                }
+                break;
+            }
             "fmt" if out.subcommand.is_none() && out.script.is_none() => {
                 let mut paths = Vec::new();
                 let mut write = false;
@@ -1743,6 +1941,11 @@ fn parse_args(argv: Vec<String>) -> ParsedArgs {
 /// process exit code; the caller is responsible for surfacing it via
 /// [`std::process::exit`] or returning it from `fn main`.
 pub fn run_cli(args: Vec<String>) -> ExitCode {
+    // If this binary was produced by `x8 compile`, run the embedded
+    // script and forward any user args. No CLI flag parsing.
+    if let Some(source) = detect_embedded_script() {
+        return run_embedded(source, args.into_iter().skip(1).collect());
+    }
     let parsed = parse_args(args);
 
     if let Some(err) = parsed.error {
@@ -1758,9 +1961,12 @@ pub fn run_cli(args: Vec<String>) -> ExitCode {
         println!("{NAME} {VERSION}");
         return ExitCode::SUCCESS;
     }
-    // `x8 fmt` does not need a JS runtime, handle it early.
+    // `x8 fmt` and `x8 compile` do not need a JS runtime; handle early.
     if let Some(Subcommand::Fmt { paths, write }) = parsed.subcommand.as_ref() {
         return cmd_fmt(paths.clone(), *write);
+    }
+    if let Some(Subcommand::Compile { input, output }) = parsed.subcommand.as_ref() {
+        return cmd_compile(input, output);
     }
 
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1800,6 +2006,10 @@ pub fn run_cli(args: Vec<String>) -> ExitCode {
 
     if let Some(Subcommand::Test { paths }) = parsed.subcommand {
         return cmd_test(paths, &mut ctx);
+    }
+    // Compile/Fmt were handled before the runtime was built.
+    if matches!(parsed.subcommand, Some(Subcommand::Compile { .. } | Subcommand::Fmt { .. })) {
+        unreachable!();
     }
     if let Some(code) = parsed.eval_code {
         return run_source(&code, "[eval]", &mut ctx);

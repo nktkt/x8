@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --verbose
+      - name: smoke test
+        run: |
+          ./target/debug/x8 --version
+          ./target/debug/x8 -e 'console.log("ci ok")'
+          ./target/debug/x8 examples/hello.ts
+          ./target/debug/x8 --allow-read examples/modules/main.ts
+          ./target/debug/x8 --allow-read test examples/sample.test.ts
+
+  lints:
+    name: lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true
