@@ -156,13 +156,19 @@ For complete details on language coverage, see the
 
 ## Roadmap
 
-Planned for future versions:
+A short summary — see [ROADMAP.md](./ROADMAP.md) for the full plan with
+deliverables, open questions, and risks for each milestone.
 
-- **v1.1** — `fetch` API and an async event loop.
-- **v1.2** — TypeScript via SWC.
-- **v1.3** — ES module loader with HTTP imports.
-- **v1.4** — Worker threads / structured concurrency.
-- **v2.0** — Optional V8 backend behind a feature flag for hot paths.
+| Version | Theme | Highlights |
+|---|---|---|
+| **v1.0** ✅ | Initial release | Script/eval/REPL, console, fs, args |
+| **v1.1** | Async I/O | `fetch`, timers, `Promise`, top-level await |
+| **v1.2** | TypeScript | TS/JSX via SWC, source maps |
+| **v1.3** | Modules | ES modules, HTTP imports, lockfile |
+| **v1.4** | Concurrency | Web Workers, `MessageChannel` |
+| **v1.5** | Permissions | Deno-style allow/deny flags |
+| **v1.6** | Embedding | Stable Rust API, WASI plugins |
+| **v2.0** | Production | Optional V8 backend, snapshots, `x8 compile` |
 
 ## Architecture
 
