@@ -1,23 +1,133 @@
 //! x8 — a minimal, fast JavaScript runtime written in Rust.
 
+use std::cell::RefCell;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use boa_engine::{
     js_string,
-    object::ObjectInitializer,
-    object::builtins::JsArray,
+    job::{FutureJob, JobQueue, NativeJob},
+    object::{builtins::{JsArray, JsFunction, JsPromise}, ObjectInitializer},
     property::Attribute,
     Context, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source,
 };
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use tokio::runtime::Runtime;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NAME: &str = "x8";
+
+// ============================================================================
+// Async job queue: bridges tokio futures into Boa's job queue.
+// ============================================================================
+
+struct AsyncJobQueue {
+    rt: Runtime,
+    promise_jobs: RefCell<VecDeque<NativeJob>>,
+    future_jobs: RefCell<Vec<FutureJob>>,
+}
+
+impl AsyncJobQueue {
+    fn new(rt: Runtime) -> Self {
+        Self {
+            rt,
+            promise_jobs: RefCell::new(VecDeque::new()),
+            future_jobs: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl JobQueue for AsyncJobQueue {
+    fn enqueue_promise_job(&self, job: NativeJob, _: &mut Context) {
+        self.promise_jobs.borrow_mut().push_back(job);
+    }
+
+    fn enqueue_future_job(&self, future: FutureJob, _: &mut Context) {
+        self.future_jobs.borrow_mut().push(future);
+    }
+
+    fn run_jobs(&self, context: &mut Context) {
+        loop {
+            // Drain all pending sync jobs first.
+            loop {
+                let job = self.promise_jobs.borrow_mut().pop_front();
+                match job {
+                    Some(job) => {
+                        if let Err(e) = job.call(context) {
+                            eprintln!("Uncaught (in promise): {e}");
+                        }
+                    }
+                    None => break,
+                }
+            }
+            // Drain pending futures.
+            let futures: Vec<FutureJob> = std::mem::take(&mut *self.future_jobs.borrow_mut());
+            if futures.is_empty() {
+                break;
+            }
+            for fut in futures {
+                let job = self.rt.block_on(fut);
+                self.promise_jobs.borrow_mut().push_back(job);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Shared runtime state (accessed from native function callbacks).
+// ============================================================================
+
+thread_local! {
+    static QUEUE: RefCell<Option<Rc<AsyncJobQueue>>> = const { RefCell::new(None) };
+    static CANCELLED_TIMERS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+}
+
+static NEXT_TIMER_ID: AtomicU32 = AtomicU32::new(1);
+
+fn install_queue(queue: Rc<AsyncJobQueue>) {
+    QUEUE.with(|q| *q.borrow_mut() = Some(queue));
+}
+
+fn queue() -> Rc<AsyncJobQueue> {
+    QUEUE.with(|q| q.borrow().as_ref().expect("job queue uninstalled").clone())
+}
+
+fn next_timer_id() -> u32 {
+    NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn cancel_timer(id: u32) {
+    CANCELLED_TIMERS.with(|c| {
+        c.borrow_mut().insert(id);
+    });
+}
+
+fn timer_is_cancelled(id: u32) -> bool {
+    CANCELLED_TIMERS.with(|c| c.borrow_mut().remove(&id))
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn js_err(msg: impl Into<String>) -> JsError {
+    JsNativeError::error().with_message(msg.into()).into()
+}
+
+fn format_value(value: &JsValue, ctx: &mut Context) -> String {
+    match value.to_string(ctx) {
+        Ok(s) => s.to_std_string_escaped(),
+        Err(_) => "<unprintable>".to_string(),
+    }
+}
 
 fn print_help() {
     println!("{NAME} {VERSION} — minimal JavaScript runtime written in Rust");
@@ -31,25 +141,23 @@ fn print_help() {
     println!("    -h, --help           Print this help message");
     println!();
     println!("EXAMPLES:");
-    println!("    x8 script.js             Run a script file");
-    println!("    x8 -e \"console.log(1+2)\"  Evaluate inline");
-    println!("    x8                       Start an interactive REPL");
+    println!("    x8 script.js                Run a script file");
+    println!("    x8 -e \"console.log(1+2)\"     Evaluate inline");
+    println!("    x8                          Start an interactive REPL");
     println!();
     println!("BUILT-IN GLOBALS:");
     println!("    console.log/error/warn/info/debug");
-    println!("    readFile(path) -> string");
-    println!("    writeFile(path, content)");
-    println!("    args                  Array of arguments after the script path");
-    println!("    exit(code)            Exit the process with a status code");
-    println!("    x8.version            Runtime version string");
+    println!("    readFile(path) / writeFile(path, content)");
+    println!("    setTimeout(fn, ms) / clearTimeout(id)");
+    println!("    setInterval(fn, ms) / clearInterval(id)");
+    println!("    queueMicrotask(fn)");
+    println!("    fetch(url, opts?) -> Promise<Response>");
+    println!("    args, exit(code), x8.version");
 }
 
-fn format_value(value: &JsValue, ctx: &mut Context) -> String {
-    match value.to_string(ctx) {
-        Ok(s) => s.to_std_string_escaped(),
-        Err(_) => "<unprintable>".to_string(),
-    }
-}
+// ============================================================================
+// Console
+// ============================================================================
 
 fn console_print(args: &[JsValue], ctx: &mut Context, to_stderr: bool) -> JsResult<JsValue> {
     let line = args
@@ -65,17 +173,19 @@ fn console_print(args: &[JsValue], ctx: &mut Context, to_stderr: bool) -> JsResu
     Ok(JsValue::undefined())
 }
 
-fn js_err(msg: impl Into<String>) -> JsError {
-    JsNativeError::error().with_message(msg.into()).into()
-}
+// ============================================================================
+// File system
+// ============================================================================
 
 fn read_file_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let path_val = args.first().ok_or_else(|| js_err("readFile: missing path"))?;
-    let path = path_val.to_string(ctx)?.to_std_string_escaped();
-    match fs::read_to_string(&path) {
-        Ok(content) => Ok(JsValue::from(JsString::from(content.as_str()))),
-        Err(e) => Err(js_err(format!("readFile({path}): {e}"))),
-    }
+    let path = args
+        .first()
+        .ok_or_else(|| js_err("readFile: missing path"))?
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    fs::read_to_string(&path)
+        .map(|s| JsValue::from(JsString::from(s.as_str())))
+        .map_err(|e| js_err(format!("readFile({path}): {e}")))
 }
 
 fn write_file_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -93,13 +203,339 @@ fn write_file_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
     Ok(JsValue::undefined())
 }
 
+// ============================================================================
+// Process
+// ============================================================================
+
 fn exit_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let code = match args.first() {
         Some(v) => v.to_i32(ctx).unwrap_or(0),
-        None => 0,
+        _none => 0,
     };
     std::process::exit(code);
 }
+
+// ============================================================================
+// Timers
+// ============================================================================
+
+fn set_timeout_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let cb_val = args
+        .first()
+        .cloned()
+        .ok_or_else(|| js_err("setTimeout: missing callback"))?;
+    let cb_obj = cb_val
+        .as_callable()
+        .ok_or_else(|| js_err("setTimeout: callback is not callable"))?
+        .clone();
+    let ms = args
+        .get(1)
+        .and_then(|v| v.to_i32(ctx).ok())
+        .unwrap_or(0)
+        .max(0) as u64;
+    let id = next_timer_id();
+    let future: FutureJob = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        NativeJob::new(move |ctx| -> JsResult<JsValue> {
+            if timer_is_cancelled(id) {
+                return Ok(JsValue::undefined());
+            }
+            cb_obj.call(&JsValue::undefined(), &[], ctx)?;
+            Ok(JsValue::undefined())
+        })
+    });
+    queue().enqueue_future_job(future, ctx);
+    Ok(JsValue::from(id))
+}
+
+fn clear_timeout_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(v) = args.first() {
+        let id = v.to_u32(ctx).unwrap_or(0);
+        cancel_timer(id);
+    }
+    Ok(JsValue::undefined())
+}
+
+fn schedule_interval(id: u32, cb: boa_engine::JsObject, ms: u64, ctx: &mut Context) {
+    let cb_for_job = cb.clone();
+    let cb_for_reschedule = cb;
+    let future: FutureJob = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        NativeJob::new(move |ctx| -> JsResult<JsValue> {
+            if timer_is_cancelled(id) {
+                return Ok(JsValue::undefined());
+            }
+            cb_for_job.call(&JsValue::undefined(), &[], ctx)?;
+            schedule_interval(id, cb_for_reschedule, ms, ctx);
+            Ok(JsValue::undefined())
+        })
+    });
+    queue().enqueue_future_job(future, ctx);
+}
+
+fn set_interval_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let cb_val = args
+        .first()
+        .cloned()
+        .ok_or_else(|| js_err("setInterval: missing callback"))?;
+    let cb_obj = cb_val
+        .as_callable()
+        .ok_or_else(|| js_err("setInterval: callback is not callable"))?
+        .clone();
+    let ms = args
+        .get(1)
+        .and_then(|v| v.to_i32(ctx).ok())
+        .unwrap_or(0)
+        .max(1) as u64;
+    let id = next_timer_id();
+    schedule_interval(id, cb_obj, ms, ctx);
+    Ok(JsValue::from(id))
+}
+
+fn clear_interval_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    clear_timeout_native(&JsValue::undefined(), args, ctx)
+}
+
+fn queue_microtask_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let cb_val = args
+        .first()
+        .cloned()
+        .ok_or_else(|| js_err("queueMicrotask: missing callback"))?;
+    let cb_obj = cb_val
+        .as_callable()
+        .ok_or_else(|| js_err("queueMicrotask: callback is not callable"))?
+        .clone();
+    let job = NativeJob::new(move |ctx| -> JsResult<JsValue> {
+        cb_obj.call(&JsValue::undefined(), &[], ctx)?;
+        Ok(JsValue::undefined())
+    });
+    queue().enqueue_promise_job(job, ctx);
+    Ok(JsValue::undefined())
+}
+
+// ============================================================================
+// fetch
+// ============================================================================
+
+struct FetchResult {
+    status: u16,
+    status_text: String,
+    url: String,
+    body: String,
+    headers: Vec<(String, String)>,
+}
+
+fn response_text_native(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let obj = this
+        .as_object()
+        .ok_or_else(|| js_err("Response.text: invalid this"))?;
+    let body = obj.get(js_string!("_body"), ctx)?;
+    Ok(JsPromise::resolve(body, ctx).into())
+}
+
+fn response_json_native(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let obj = this
+        .as_object()
+        .ok_or_else(|| js_err("Response.json: invalid this"))?;
+    let body = obj.get(js_string!("_body"), ctx)?;
+    let body_str = body.to_string(ctx)?.to_std_string_escaped();
+    let json_global = ctx.global_object().get(js_string!("JSON"), ctx)?;
+    let json_obj = json_global
+        .as_object()
+        .ok_or_else(|| js_err("JSON is not an object"))?
+        .clone();
+    let parse = json_obj.get(js_string!("parse"), ctx)?;
+    let parse_fn = parse
+        .as_callable()
+        .ok_or_else(|| js_err("JSON.parse is not callable"))?
+        .clone();
+    let parsed = parse_fn.call(
+        &JsValue::from(json_obj),
+        &[JsValue::from(JsString::from(body_str.as_str()))],
+        ctx,
+    )?;
+    Ok(JsPromise::resolve(parsed, ctx).into())
+}
+
+fn build_response(result: &FetchResult, ctx: &mut Context) -> JsResult<JsValue> {
+    let mut h = ObjectInitializer::new(ctx);
+    for (k, v) in &result.headers {
+        h.property(
+            JsString::from(k.as_str()),
+            JsValue::from(JsString::from(v.as_str())),
+            Attribute::all(),
+        );
+    }
+    let headers = h.build();
+
+    let obj = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("ok"),
+            JsValue::from(result.status < 400),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("status"),
+            JsValue::from(result.status),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("statusText"),
+            JsValue::from(JsString::from(result.status_text.as_str())),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("url"),
+            JsValue::from(JsString::from(result.url.as_str())),
+            Attribute::all(),
+        )
+        .property(js_string!("headers"), headers, Attribute::all())
+        .property(
+            js_string!("_body"),
+            JsValue::from(JsString::from(result.body.as_str())),
+            Attribute::all(),
+        )
+        .function(
+            NativeFunction::from_fn_ptr(response_text_native),
+            js_string!("text"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(response_json_native),
+            js_string!("json"),
+            0,
+        )
+        .build();
+
+    Ok(JsValue::from(obj))
+}
+
+fn fetch_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let url = args
+        .first()
+        .ok_or_else(|| js_err("fetch: missing URL"))?
+        .to_string(ctx)?
+        .to_std_string_escaped();
+
+    // Optional method/body/headers from second arg.
+    let mut method = "GET".to_string();
+    let mut body: Option<String> = None;
+    let mut header_pairs: Vec<(String, String)> = Vec::new();
+    if let Some(opts_val) = args.get(1) {
+        if let Some(opts) = opts_val.as_object() {
+            if let Ok(m) = opts.get(js_string!("method"), ctx) {
+                if !m.is_undefined() {
+                    method = m.to_string(ctx)?.to_std_string_escaped();
+                }
+            }
+            if let Ok(b) = opts.get(js_string!("body"), ctx) {
+                if !b.is_undefined() && !b.is_null() {
+                    body = Some(b.to_string(ctx)?.to_std_string_escaped());
+                }
+            }
+            if let Ok(h) = opts.get(js_string!("headers"), ctx) {
+                if let Some(h_obj) = h.as_object() {
+                    // Iterate own enumerable string keys.
+                    let keys = h_obj.own_property_keys(ctx)?;
+                    for key in keys {
+                        if let boa_engine::property::PropertyKey::String(s) = &key {
+                            let v = h_obj.get(key.clone(), ctx)?;
+                            header_pairs.push((
+                                s.to_std_string_escaped(),
+                                v.to_string(ctx)?.to_std_string_escaped(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let resolve_slot: Rc<RefCell<Option<JsFunction>>> = Default::default();
+    let reject_slot: Rc<RefCell<Option<JsFunction>>> = Default::default();
+    let r_clone = resolve_slot.clone();
+    let rj_clone = reject_slot.clone();
+
+    let promise = JsPromise::new(
+        move |resolvers, _ctx| {
+            *r_clone.borrow_mut() = Some(resolvers.resolve.clone());
+            *rj_clone.borrow_mut() = Some(resolvers.reject.clone());
+            Ok(JsValue::undefined())
+        },
+        ctx,
+    );
+
+    let resolve = resolve_slot
+        .borrow()
+        .as_ref()
+        .expect("resolver not captured")
+        .clone();
+    let reject = reject_slot
+        .borrow()
+        .as_ref()
+        .expect("reject not captured")
+        .clone();
+
+    let url_for_err = url.clone();
+    let future: FutureJob = Box::pin(async move {
+        let outcome: Result<FetchResult, String> = async {
+            let client = reqwest::Client::new();
+            let parsed_method = reqwest::Method::from_bytes(method.as_bytes())
+                .map_err(|e| format!("bad method: {e}"))?;
+            let mut req = client.request(parsed_method, &url);
+            for (k, v) in header_pairs.iter() {
+                req = req.header(k, v);
+            }
+            if let Some(b) = body {
+                req = req.body(b);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            let status = resp.status().as_u16();
+            let status_text = resp
+                .status()
+                .canonical_reason()
+                .unwrap_or("")
+                .to_string();
+            let final_url = resp.url().to_string();
+            let mut headers_out = Vec::new();
+            for (k, v) in resp.headers().iter() {
+                headers_out.push((k.to_string(), v.to_str().unwrap_or("").to_string()));
+            }
+            let body_text = resp.text().await.map_err(|e| e.to_string())?;
+            Ok(FetchResult {
+                status,
+                status_text,
+                url: final_url,
+                body: body_text,
+                headers: headers_out,
+            })
+        }
+        .await;
+
+        NativeJob::new(move |ctx| -> JsResult<JsValue> {
+            match outcome {
+                Ok(result) => {
+                    let resp_val = build_response(&result, ctx)?;
+                    resolve.call(&JsValue::undefined(), &[resp_val], ctx)?;
+                }
+                Err(e) => {
+                    let msg = JsValue::from(JsString::from(
+                        format!("fetch({url_for_err}): {e}").as_str(),
+                    ));
+                    reject.call(&JsValue::undefined(), &[msg], ctx)?;
+                }
+            }
+            Ok(JsValue::undefined())
+        })
+    });
+
+    queue().enqueue_future_job(future, ctx);
+    Ok(promise.into())
+}
+
+// ============================================================================
+// Register globals
+// ============================================================================
 
 fn register_globals(ctx: &mut Context, script_args: &[String]) -> JsResult<()> {
     // console
@@ -132,27 +568,37 @@ fn register_globals(ctx: &mut Context, script_args: &[String]) -> JsResult<()> {
         .build();
     ctx.register_global_property(js_string!("console"), console, Attribute::all())?;
 
-    // readFile, writeFile, exit
-    ctx.register_global_callable(
-        js_string!("readFile"),
-        1,
-        NativeFunction::from_fn_ptr(read_file_native),
-    )?;
-    ctx.register_global_callable(
-        js_string!("writeFile"),
-        2,
-        NativeFunction::from_fn_ptr(write_file_native),
-    )?;
-    ctx.register_global_callable(
-        js_string!("exit"),
-        1,
-        NativeFunction::from_fn_ptr(exit_native),
-    )?;
+    macro_rules! reg {
+        ($name:literal, $arity:expr, $func:expr) => {
+            ctx.register_global_callable(
+                js_string!($name),
+                $arity,
+                NativeFunction::from_fn_ptr($func),
+            )?;
+        };
+    }
 
-    // args array
+    reg!("readFile", 1, read_file_native);
+    reg!("readFileSync", 1, read_file_native);
+    reg!("writeFile", 2, write_file_native);
+    reg!("writeFileSync", 2, write_file_native);
+    reg!("exit", 1, exit_native);
+    reg!("setTimeout", 2, set_timeout_native);
+    reg!("clearTimeout", 1, clear_timeout_native);
+    reg!("setInterval", 2, set_interval_native);
+    reg!("clearInterval", 1, clear_interval_native);
+    reg!("queueMicrotask", 1, queue_microtask_native);
+    reg!("fetch", 1, fetch_native);
+
+    // args
     let arr = JsArray::new(ctx);
     for (i, s) in script_args.iter().enumerate() {
-        arr.set(i as u32, JsValue::from(JsString::from(s.as_str())), false, ctx)?;
+        arr.set(
+            i as u32,
+            JsValue::from(JsString::from(s.as_str())),
+            false,
+            ctx,
+        )?;
     }
     ctx.register_global_property(js_string!("args"), arr, Attribute::all())?;
 
@@ -174,9 +620,16 @@ fn register_globals(ctx: &mut Context, script_args: &[String]) -> JsResult<()> {
     Ok(())
 }
 
+// ============================================================================
+// Execution
+// ============================================================================
+
 fn run_source(source: &str, label: &str, ctx: &mut Context) -> ExitCode {
     match ctx.eval(Source::from_bytes(source.as_bytes())) {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(_) => {
+            queue().run_jobs(ctx);
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("{NAME}: {label}: {e}");
             ExitCode::from(1)
@@ -217,6 +670,7 @@ fn run_repl(ctx: &mut Context) -> ExitCode {
                 let _ = rl.add_history_entry(line.as_str());
                 match ctx.eval(Source::from_bytes(line.as_bytes())) {
                     Ok(v) => {
+                        queue().run_jobs(ctx);
                         if !v.is_undefined() {
                             let mut stdout = io::stdout().lock();
                             let _ = writeln!(stdout, "{}", format_value(&v, ctx));
@@ -235,6 +689,10 @@ fn run_repl(ctx: &mut Context) -> ExitCode {
     }
     ExitCode::SUCCESS
 }
+
+// ============================================================================
+// Arg parsing
+// ============================================================================
 
 #[derive(Default)]
 struct ParsedArgs {
@@ -255,7 +713,7 @@ fn parse_args(argv: Vec<String>) -> ParsedArgs {
             "-V" | "--version" => out.show_version = true,
             "-e" | "--eval" => match iter.next() {
                 Some(code) => out.eval_code = Some(code),
-                None => {
+                _none => {
                     out.error = Some(format!("{arg} requires an argument"));
                     return out;
                 }
@@ -278,6 +736,10 @@ fn parse_args(argv: Vec<String>) -> ParsedArgs {
     out
 }
 
+// ============================================================================
+// Main
+// ============================================================================
+
 fn main() -> ExitCode {
     let parsed = parse_args(env::args().collect());
 
@@ -295,7 +757,26 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let mut ctx = Context::default();
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("{NAME}: failed to build tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let job_queue = Rc::new(AsyncJobQueue::new(rt));
+    install_queue(job_queue.clone());
+
+    let mut ctx = match Context::builder().job_queue(job_queue).build() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{NAME}: failed to build context: {e}");
+            return ExitCode::from(1);
+        }
+    };
     if let Err(e) = register_globals(&mut ctx, &parsed.script_args) {
         eprintln!("{NAME}: failed to initialize runtime: {e}");
         return ExitCode::from(1);

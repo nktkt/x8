@@ -35,32 +35,30 @@ The minimum viable JavaScript runtime.
 
 ---
 
-## v1.1.0 — Async I/O and `fetch` 🚧
+## v1.1.0 — Async I/O and `fetch` ✅
 
-**Theme:** Make x8 useful for talking to the network.
+**Status:** Released.
 
-This is the largest jump on the roadmap. Adding async breaks the
-"synchronous everything" simplicity of v1.0, so we need to introduce
-an event loop carefully.
+### Delivered
 
-### Deliverables
-
-- [ ] Embedded `tokio` runtime, driven from `main`
-- [ ] Microtask queue bridged to Boa's job queue
-- [ ] `Promise`-returning native functions (helper macro)
-- [ ] **Timers**: `setTimeout`, `setInterval`, `clearTimeout`,
+- [x] Embedded `tokio` runtime, driven from `main`
+- [x] Microtask queue bridged to Boa's job queue
+- [x] `Promise`-returning native functions (`fetch`)
+- [x] **Timers**: `setTimeout`, `setInterval`, `clearTimeout`,
       `clearInterval`, `queueMicrotask`
-- [ ] **`fetch`** (subset of the WHATWG Fetch spec)
+- [x] **`fetch`** (subset of the WHATWG Fetch spec)
   - `fetch(url)` and `fetch(url, { method, headers, body })`
-  - `Response` with `.text()`, `.json()`, `.arrayBuffer()`, `.ok`,
-    `.status`, `.statusText`, `.headers`
-  - `Request`, `Headers`
-  - No streaming bodies yet (full buffering)
-- [ ] **Async file APIs**: `readFile` / `writeFile` become async, with
-      sync versions preserved as `readFileSync` / `writeFileSync`
-      (Node-compatible naming)
-- [ ] **`AbortController`** / `AbortSignal`
-- [ ] Top-level `await` in scripts
+  - `Response` with `.text()`, `.json()`, `.ok`, `.status`,
+    `.statusText`, `.url`, `.headers`
+  - Full body buffering (no streaming bodies yet)
+- [x] `readFileSync` / `writeFileSync` aliases for Node compat
+
+### Deferred to later versions
+
+- `AbortController` / `AbortSignal` — v1.5 (ties into permissions)
+- Streaming bodies — v1.4 (after Workers)
+- Top-level `await` — depends on v1.3 module support
+- Parallel future execution — currently sequential `block_on`
 
 ### Open questions
 

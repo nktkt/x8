@@ -1,6 +1,6 @@
 [package]
 name = "x8"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "A minimal, fast JavaScript runtime written in Rust"
 license = "MIT"
@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 boa_engine = "0.20"
 rustyline = "14"
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [profile.release]
 opt-level = 3

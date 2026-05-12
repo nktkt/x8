@@ -102,12 +102,31 @@ console.log("got:", args);
 | `console.warn(...args)` | function | Print to stderr. |
 | `console.info(...args)` | function | Print to stdout. |
 | `console.debug(...args)` | function | Print to stderr. |
-| `readFile(path)` | function | Read a UTF-8 file synchronously. Returns the contents as a string. |
-| `writeFile(path, content)` | function | Write a string to disk synchronously. |
+| `readFile(path)` / `readFileSync(path)` | function | Read a UTF-8 file. Returns its contents as a string. |
+| `writeFile(path, content)` / `writeFileSync` | function | Write a string to disk. |
+| `setTimeout(fn, ms)` | function | Schedule `fn` to run after `ms` milliseconds. Returns a timer ID. |
+| `clearTimeout(id)` | function | Cancel a pending `setTimeout`. |
+| `setInterval(fn, ms)` | function | Run `fn` repeatedly every `ms` milliseconds. Returns a timer ID. |
+| `clearInterval(id)` | function | Cancel a `setInterval`. |
+| `queueMicrotask(fn)` | function | Run `fn` on the microtask queue. |
+| `fetch(url, opts?)` | function | Returns a `Promise<Response>`. Subset of the WHATWG Fetch spec. |
 | `exit(code?)` | function | Terminate the process with an optional exit code (defaults to `0`). |
 | `args` | array | Arguments passed to the script. |
-| `x8.version` | string | Runtime version (e.g. `"1.0.0"`). |
+| `x8.version` | string | Runtime version (e.g. `"1.1.0"`). |
 | `x8.name` | string | Runtime name (`"x8"`). |
+
+### Fetch response shape
+
+```js
+const res = await fetch(url, { method, headers, body });
+// res.ok          - boolean (status < 400)
+// res.status      - number  (200, 404, …)
+// res.statusText  - string  ("OK", "Not Found", …)
+// res.url         - string  (final URL after redirects)
+// res.headers     - object  (header name → value)
+// res.text()      - Promise<string>
+// res.json()      - Promise<any>
+```
 
 ## Examples
 
@@ -162,7 +181,7 @@ deliverables, open questions, and risks for each milestone.
 | Version | Theme | Highlights |
 |---|---|---|
 | **v1.0** ✅ | Initial release | Script/eval/REPL, console, fs, args |
-| **v1.1** | Async I/O | `fetch`, timers, `Promise`, top-level await |
+| **v1.1** ✅ | Async I/O | `fetch`, timers, `Promise`, microtasks |
 | **v1.2** | TypeScript | TS/JSX via SWC, source maps |
 | **v1.3** | Modules | ES modules, HTTP imports, lockfile |
 | **v1.4** | Concurrency | Web Workers, `MessageChannel` |
