@@ -132,6 +132,52 @@ impl JobQueue for AsyncJobQueue {
 }
 
 // ============================================================================
+// Permissions
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct Permissions {
+    read: bool,
+    write: bool,
+    net: bool,
+    env: bool,
+    run: bool,
+}
+
+impl Permissions {
+    fn all_allowed() -> Self {
+        Self {
+            read: true,
+            write: true,
+            net: true,
+            env: true,
+            run: true,
+        }
+    }
+}
+
+thread_local! {
+    static PERMISSIONS: RefCell<Permissions> = RefCell::new(Permissions::all_allowed());
+}
+
+fn install_permissions(p: Permissions) {
+    PERMISSIONS.with(|c| *c.borrow_mut() = p);
+}
+
+fn perms() -> Permissions {
+    PERMISSIONS.with(|c| *c.borrow())
+}
+
+fn require_perm(category: &str, ok: bool) -> JsResult<()> {
+    if !ok {
+        return Err(js_err(format!(
+            "permission denied: {category} (rerun without --deny-{category})"
+        )));
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Module loader (file:// and https:// imports, with on-disk HTTP cache).
 // ============================================================================
 
@@ -236,10 +282,12 @@ impl ModuleLoader for X8ModuleLoader {
             }
             let (source_text, source_path) =
                 if resolved.starts_with("https://") || resolved.starts_with("http://") {
+                    require_perm("net", perms().net)?;
                     let body =
                         fetch_http_cached(&resolved, &self.cache_dir).map_err(js_err)?;
                     (body, PathBuf::from(&resolved))
                 } else {
+                    require_perm("read", perms().read)?;
                     let path = PathBuf::from(&resolved);
                     let body = fs::read_to_string(&path)
                         .map_err(|e| js_err(format!("load {resolved}: {e}")))?;
@@ -332,6 +380,12 @@ fn print_help() {
     println!("    -V, --version        Print version information");
     println!("    -h, --help           Print this help message");
     println!();
+    println!("PERMISSIONS (opt-in deny in v1.x, default-deny in v2.0):");
+    println!("    --allow-all          Allow all capabilities (no-op in v1.x)");
+    println!("    --allow-read/write/net/env/run   Allow that capability");
+    println!("    --deny-all           Deny all capabilities");
+    println!("    --deny-read/write/net/env/run    Deny that capability");
+    println!();
     println!("EXAMPLES:");
     println!("    x8 script.js                Run a script file");
     println!("    x8 -e \"console.log(1+2)\"     Evaluate inline");
@@ -370,6 +424,7 @@ fn console_print(args: &[JsValue], ctx: &mut Context, to_stderr: bool) -> JsResu
 // ============================================================================
 
 fn read_file_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    require_perm("read", perms().read)?;
     let path = args
         .first()
         .ok_or_else(|| js_err("readFile: missing path"))?
@@ -381,6 +436,7 @@ fn read_file_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
 }
 
 fn write_file_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    require_perm("write", perms().write)?;
     let path = args
         .first()
         .ok_or_else(|| js_err("writeFile: missing path"))?
@@ -603,6 +659,7 @@ fn build_response(result: &FetchResult, ctx: &mut Context) -> JsResult<JsValue> 
 }
 
 fn fetch_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    require_perm("net", perms().net)?;
     let url = args
         .first()
         .ok_or_else(|| js_err("fetch: missing URL"))?
@@ -838,7 +895,9 @@ fn worker_main(
     path: PathBuf,
     cmd_rx: mpsc::Receiver<WorkerCmd>,
     event_tx: mpsc::Sender<WorkerEvent>,
+    permissions: Permissions,
 ) {
+    install_permissions(permissions);
     // Tokio runtime + Boa context for this worker.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -992,6 +1051,7 @@ fn worker_main(
 }
 
 fn new_worker_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    require_perm("run", perms().run)?;
     let path_str = args
         .first()
         .ok_or_else(|| js_err("Worker: missing path"))?
@@ -1002,6 +1062,7 @@ fn new_worker_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
     let id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let event_tx = main_event_sender();
+    let inherited_perms = perms();
 
     let worker_obj = ObjectInitializer::new(ctx)
         .property(js_string!("_id"), JsValue::from(id), Attribute::all())
@@ -1029,7 +1090,7 @@ fn new_worker_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
         );
     });
 
-    thread::spawn(move || worker_main(id, path, cmd_rx, event_tx));
+    thread::spawn(move || worker_main(id, path, cmd_rx, event_tx, inherited_perms));
 
     Ok(JsValue::from(worker_obj))
 }
@@ -1340,10 +1401,13 @@ struct ParsedArgs {
     script: Option<String>,
     script_args: Vec<String>,
     error: Option<String>,
+    permissions: Option<Permissions>,
 }
 
 fn parse_args(argv: Vec<String>) -> ParsedArgs {
     let mut out = ParsedArgs::default();
+    let mut perms = Permissions::all_allowed();
+    let mut perms_touched = false;
     let mut iter = argv.into_iter().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1356,6 +1420,42 @@ fn parse_args(argv: Vec<String>) -> ParsedArgs {
                     return out;
                 }
             },
+            // Permission flags. In v1.x, default is allow-all; --deny-* subtracts.
+            "--allow-all" | "--allow-read" | "--allow-write" | "--allow-net"
+            | "--allow-env" | "--allow-run" => {
+                perms_touched = true;
+                // No-op in v1.x: default already allows everything.
+            }
+            "--deny-all" => {
+                perms = Permissions {
+                    read: false,
+                    write: false,
+                    net: false,
+                    env: false,
+                    run: false,
+                };
+                perms_touched = true;
+            }
+            "--deny-read" => {
+                perms.read = false;
+                perms_touched = true;
+            }
+            "--deny-write" => {
+                perms.write = false;
+                perms_touched = true;
+            }
+            "--deny-net" => {
+                perms.net = false;
+                perms_touched = true;
+            }
+            "--deny-env" => {
+                perms.env = false;
+                perms_touched = true;
+            }
+            "--deny-run" => {
+                perms.run = false;
+                perms_touched = true;
+            }
             "--" => {
                 out.script_args.extend(iter.by_ref());
                 break;
@@ -1370,6 +1470,9 @@ fn parse_args(argv: Vec<String>) -> ParsedArgs {
                 break;
             }
         }
+    }
+    if perms_touched {
+        out.permissions = Some(perms);
     }
     out
 }
@@ -1405,6 +1508,9 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Some(p) = parsed.permissions {
+        install_permissions(p);
+    }
     init_worker_events();
     let job_queue = Rc::new(AsyncJobQueue::new(rt));
     install_queue(job_queue.clone());

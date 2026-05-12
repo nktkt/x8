@@ -153,29 +153,30 @@ The minimum viable JavaScript runtime.
 
 ---
 
-## v1.5.0 — Permissions
+## v1.5.0 — Permissions ✅
 
-**Theme:** Make x8 safe to run untrusted code in.
+**Status:** Released.
 
-Inspired by Deno's permission model, but more granular.
+### Delivered
 
-### Deliverables
+- [x] `--allow-read` / `--deny-read` (gates `readFile`,
+      `readFileSync`, file imports)
+- [x] `--allow-write` / `--deny-write` (gates `writeFile`,
+      `writeFileSync`)
+- [x] `--allow-net` / `--deny-net` (gates `fetch`, HTTP imports)
+- [x] `--allow-env` / `--deny-env` (reserved — no env API yet)
+- [x] `--allow-run` / `--deny-run` (gates `Worker(...)`)
+- [x] `--allow-all` / `--deny-all` (bulk operations)
+- [x] Permissions inherited by workers from the spawning context
+- [x] Default-allow in v1.x (backwards compatible); allow-only flags
+      are no-ops to support forward-compatible scripts
 
-- [ ] `--allow-read[=<paths>]` / `--deny-read`
-- [ ] `--allow-write[=<paths>]` / `--deny-write`
-- [ ] `--allow-net[=<hosts>]` / `--deny-net`
-- [ ] `--allow-env[=<vars>]` / `--deny-env`
-- [ ] `--allow-run[=<cmds>]` / `--deny-run`
-- [ ] `--allow-all` (escape hatch, off by default)
-- [ ] Runtime permission API: `Permissions.request({ name: "net",
-      host: "..." })` returning a Promise
-- [ ] Audit log via `--audit` flag (writes every permission check to
-      stderr)
+### Deferred to v2.0
 
-### Notes
-
-- The permission model becomes the **default-deny** posture in v2.0;
-  in v1.5 it ships as opt-in to preserve backwards compatibility.
+- Default-deny posture (breaking change — see v2.0)
+- Path/host scoping: `--allow-read=/srv,/etc` — currently all-or-none
+- Runtime `Permissions.request()` API
+- `--audit` flag
 
 ---
 
