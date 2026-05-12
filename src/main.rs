@@ -1,19 +1,22 @@
 //! x8 — a minimal, fast JavaScript runtime written in Rust.
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use boa_engine::{
+    builtins::promise::PromiseState,
     js_string,
     job::{FutureJob, JobQueue, NativeJob},
+    module::{Module, ModuleLoader, Referrer},
     object::{builtins::{JsArray, JsFunction, JsPromise}, ObjectInitializer},
     property::Attribute,
     Context, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source,
@@ -78,6 +81,148 @@ impl JobQueue for AsyncJobQueue {
                 self.promise_jobs.borrow_mut().push_back(job);
             }
         }
+    }
+}
+
+// ============================================================================
+// Module loader (file:// and https:// imports, with on-disk HTTP cache).
+// ============================================================================
+
+fn x8_cache_dir() -> PathBuf {
+    if let Ok(dir) = env::var("X8_CACHE") {
+        return PathBuf::from(dir);
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache").join("x8").join("deps");
+    }
+    PathBuf::from(".x8-cache")
+}
+
+fn cache_filename(url: &str) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut h);
+    let ext = if url.ends_with(".ts") || url.contains(".ts?") {
+        ".ts"
+    } else if url.ends_with(".tsx") {
+        ".tsx"
+    } else if url.ends_with(".mjs") {
+        ".mjs"
+    } else {
+        ".js"
+    };
+    format!("{:016x}{}", h.finish(), ext)
+}
+
+fn fetch_http_cached(url: &str, cache_dir: &Path) -> Result<String, String> {
+    let _ = fs::create_dir_all(cache_dir);
+    let cache_path = cache_dir.join(cache_filename(url));
+    if cache_path.exists() {
+        if let Ok(s) = fs::read_to_string(&cache_path) {
+            return Ok(s);
+        }
+    }
+    let body = reqwest::blocking::get(url)
+        .map_err(|e| format!("http GET {url}: {e}"))?
+        .text()
+        .map_err(|e| format!("http body {url}: {e}"))?;
+    let _ = fs::write(&cache_path, &body);
+    Ok(body)
+}
+
+fn resolve_specifier(referrer: &Referrer, specifier: &str) -> Result<String, String> {
+    // Absolute http/https URL.
+    if specifier.starts_with("https://") || specifier.starts_with("http://") {
+        return Ok(specifier.to_string());
+    }
+    // Relative to referrer.
+    let referrer_path = referrer.path();
+    let referrer_str = referrer_path.and_then(|p| p.to_str()).unwrap_or("");
+    // If referrer is an HTTP URL, resolve relatively against it (string join).
+    if referrer_str.starts_with("https://") || referrer_str.starts_with("http://") {
+        if let Some(idx) = referrer_str.rfind('/') {
+            return Ok(format!("{}/{}", &referrer_str[..idx], specifier));
+        }
+        return Ok(format!("{referrer_str}/{specifier}"));
+    }
+    // File-system relative.
+    if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/') {
+        let base = referrer_path
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+        let joined = base.join(specifier);
+        return Ok(joined.to_string_lossy().to_string());
+    }
+    Err(format!(
+        "bare specifier not supported: {specifier} (use a relative path or full URL)"
+    ))
+}
+
+struct X8ModuleLoader {
+    cache_dir: PathBuf,
+    modules: RefCell<HashMap<String, Module>>,
+}
+
+impl X8ModuleLoader {
+    fn new() -> Self {
+        Self {
+            cache_dir: x8_cache_dir(),
+            modules: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl ModuleLoader for X8ModuleLoader {
+    fn load_imported_module(
+        &self,
+        referrer: Referrer,
+        specifier: JsString,
+        finish_load: Box<dyn FnOnce(JsResult<Module>, &mut Context)>,
+        context: &mut Context,
+    ) {
+        let spec_str = specifier.to_std_string_escaped();
+
+        let result = (|| -> JsResult<Module> {
+            let resolved = resolve_specifier(&referrer, &spec_str).map_err(js_err)?;
+            if let Some(m) = self.modules.borrow().get(&resolved) {
+                return Ok(m.clone());
+            }
+            let (source_text, source_path) =
+                if resolved.starts_with("https://") || resolved.starts_with("http://") {
+                    let body =
+                        fetch_http_cached(&resolved, &self.cache_dir).map_err(js_err)?;
+                    (body, PathBuf::from(&resolved))
+                } else {
+                    let path = PathBuf::from(&resolved);
+                    let body = fs::read_to_string(&path)
+                        .map_err(|e| js_err(format!("load {resolved}: {e}")))?;
+                    (body, path)
+                };
+            let js = if is_typescript_path(&source_path) {
+                transpile(&source_text, &source_path)
+                    .map_err(|e| js_err(format!("transpile {resolved}: {e}")))?
+            } else {
+                source_text
+            };
+            let source = Source::from_bytes(js.as_bytes()).with_path(&source_path);
+            let module = Module::parse(source, None, context)?;
+            self.modules
+                .borrow_mut()
+                .insert(resolved, module.clone());
+            Ok(module)
+        })();
+
+        finish_load(result, context);
+    }
+
+    fn register_module(&self, specifier: JsString, module: Module) {
+        let key = specifier.to_std_string_escaped();
+        self.modules.borrow_mut().insert(key, module);
+    }
+
+    fn get_module(&self, specifier: JsString) -> Option<Module> {
+        let key = specifier.to_std_string_escaped();
+        self.modules.borrow().get(&key).cloned()
     }
 }
 
@@ -685,6 +830,44 @@ fn transpile(source: &str, path: &Path) -> Result<String, String> {
     Ok(Codegen::new().build(&program).code)
 }
 
+fn is_module_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("mjs" | "mts" | "ts" | "tsx" | "jsx" | "cts")
+    )
+}
+
+fn run_module(source: String, path: &Path, ctx: &mut Context) -> ExitCode {
+    let parsed = match Module::parse(
+        Source::from_bytes(source.as_bytes()).with_path(path),
+        None,
+        ctx,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{NAME}: {}: parse error: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let promise = parsed.load_link_evaluate(ctx);
+    queue().run_jobs(ctx);
+    match promise.state() {
+        PromiseState::Pending => {
+            eprintln!("{NAME}: {}: module evaluation never resolved", path.display());
+            ExitCode::from(1)
+        }
+        PromiseState::Fulfilled(_) => ExitCode::SUCCESS,
+        PromiseState::Rejected(reason) => {
+            let s = reason
+                .to_string(ctx)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_else(|_| "<unprintable error>".to_string());
+            eprintln!("{NAME}: {}: {s}", path.display());
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn run_file(path: &Path, ctx: &mut Context) -> ExitCode {
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -704,7 +887,11 @@ fn run_file(path: &Path, ctx: &mut Context) -> ExitCode {
     } else {
         raw
     };
-    run_source(&source, &path.display().to_string(), ctx)
+    if is_module_path(path) {
+        run_module(source, path, ctx)
+    } else {
+        run_source(&source, &path.display().to_string(), ctx)
+    }
 }
 
 fn run_repl(ctx: &mut Context) -> ExitCode {
@@ -829,7 +1016,13 @@ fn main() -> ExitCode {
     let job_queue = Rc::new(AsyncJobQueue::new(rt));
     install_queue(job_queue.clone());
 
-    let mut ctx = match Context::builder().job_queue(job_queue).build() {
+    let module_loader = Rc::new(X8ModuleLoader::new());
+
+    let mut ctx = match Context::builder()
+        .job_queue(job_queue)
+        .module_loader(module_loader)
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{NAME}: failed to build context: {e}");

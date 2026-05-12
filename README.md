@@ -184,7 +184,41 @@ console.log(tree);
 - No type checking — types are stripped, not verified. Use `tsc
   --noEmit` for type validation.
 - No source maps yet (runtime errors point at transpiled JS).
-- No `import` resolution — modules land in v1.3.
+
+## Modules
+
+Files with extensions `.mjs`, `.mts`, `.ts`, `.tsx`, `.jsx`, or `.cts`
+are run as **ES modules**. They support `import` / `export`, dynamic
+`import()`, and **top-level `await`**.
+
+### Relative imports
+
+```ts
+// math.ts
+export const square = (n: number) => n * n;
+```
+```ts
+// main.ts
+import { square } from "./math.ts";
+console.log(square(5));   // 25
+```
+
+### HTTP(S) imports
+
+```ts
+import { something } from "https://example.com/lib.js";
+```
+
+Downloaded modules are cached under `~/.cache/x8/deps/` (override
+with the `X8_CACHE` environment variable). Subsequent runs read from
+the cache without making a network request.
+
+### Dynamic imports
+
+```ts
+const helpers = await import("./helpers.ts");
+helpers.run();
+```
 
 ## Language support
 
@@ -211,7 +245,7 @@ deliverables, open questions, and risks for each milestone.
 | **v1.0** ✅ | Initial release | Script/eval/REPL, console, fs, args |
 | **v1.1** ✅ | Async I/O | `fetch`, timers, `Promise`, microtasks |
 | **v1.2** ✅ | TypeScript | TS/JSX via oxc, type stripping |
-| **v1.3** | Modules | ES modules, HTTP imports, lockfile |
+| **v1.3** ✅ | Modules | ES modules, dynamic import, HTTP imports |
 | **v1.4** | Concurrency | Web Workers, `MessageChannel` |
 | **v1.5** | Permissions | Deno-style allow/deny flags |
 | **v1.6** | Embedding | Stable Rust API, WASI plugins |

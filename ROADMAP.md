@@ -98,30 +98,28 @@ The minimum viable JavaScript runtime.
 
 ---
 
-## v1.3.0 — ES modules and HTTP imports
+## v1.3.0 — ES modules and HTTP imports ✅
 
-**Theme:** Make code shareable and composable.
+**Status:** Released.
 
-### Deliverables
+### Delivered
 
-- [ ] **Static `import` / `export`** support beyond what Boa already
-      provides — wire up a real module loader
-- [ ] **Dynamic `import()`** returning a Promise
-- [ ] **Relative imports**: `./foo.js`, `../bar/baz.ts`
-- [ ] **HTTP imports**: `import x from "https://esm.sh/lodash"` with
-      an on-disk cache (`~/.cache/x8/deps/`)
-- [ ] **Import maps** (`x8.json` or `import_map.json`) for aliasing
-      and pinning versions
-- [ ] **Integrity locking** (`x8.lock`) — content hashes for every
-      remote import, verified on subsequent runs
-- [ ] **`x8 cache <url>`** subcommand to pre-fetch dependencies
-- [ ] Permissions: HTTP imports gated behind `--allow-net` (off by
-      default once permissions land — see v1.5)
+- [x] **Static `import` / `export`** via a custom `ModuleLoader`
+- [x] **Dynamic `import()`** returning a Promise
+- [x] **Top-level `await`** in module-mode files
+- [x] **Relative imports**: `./foo.js`, `../bar/baz.ts`
+- [x] **HTTP(S) imports** with on-disk cache at `~/.cache/x8/deps/`
+      (override with `X8_CACHE` env var)
+- [x] **Auto-transpile** TypeScript when imported from another file
+- [x] Module-mode detection by extension (`.mjs`, `.mts`, `.ts`,
+      `.tsx`, `.jsx`, `.cts`)
 
-### Open questions
+### Deferred to later versions
 
-- npm compatibility: do we resolve `node_modules` like Bun, or stay
-  HTTP-only like Deno's original design? Probably **both, opt-in**.
+- Import maps (`x8.json`) — v2.x
+- Integrity lockfile (`x8.lock`) — v2.x
+- `x8 cache <url>` subcommand — v2.0
+- npm/`node_modules` resolution — explicit non-goal for now
 
 ---
 
