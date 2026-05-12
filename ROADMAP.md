@@ -204,23 +204,35 @@ The minimum viable JavaScript runtime.
 
 ---
 
-## v2.0.0 — Pluggable engine and stable API
+## v2.0.0 — Production readiness ✅
 
-**Theme:** Production readiness.
+**Status:** Released.
 
-### Deliverables
+### Delivered
 
-- [ ] **Default-deny permissions** (breaking change from v1.x)
-- [ ] **Optional V8 backend** behind `--features v8` for hot paths —
-      same JS APIs, different engine
-- [ ] **Stable embedding API** with a semver guarantee
-- [ ] **Snapshots** — pre-compile a startup heap so cold start is
-      ~milliseconds
-- [ ] **Built-in test runner**: `x8 test`
-- [ ] **Built-in formatter**: `x8 fmt`
-- [ ] **Single-file binaries**: `x8 compile script.js -o myapp` (à la
-      Bun)
-- [ ] Pre-built binaries for macOS, Linux, Windows on GitHub Releases
+- [x] **Default-deny permissions** — `--allow-*` flags now required
+      to use I/O, network, or workers (breaking change from v1.x)
+- [x] **`x8 test`** — discovers `*.test.{ts,js}` and `*.spec.{ts,js}`
+      recursively, runs them, reports pass/fail counts
+- [x] **`x8 fmt`** — re-emits source via oxc Codegen, with
+      `--write` to overwrite in place
+- [x] **Test globals**: `test(name, fn)`, `assert(value, msg?)`,
+      `assertEq(a, b)`
+- [x] **Library/binary split** (v1.6 carryover): `x8::run_cli`,
+      public `Permissions`
+
+### Deferred — beyond v2.0
+
+These items from the original v2.0 plan were honest stretches; v2.x
+milestones can pick them up:
+
+- Optional V8 backend behind `--features v8` (large undertaking)
+- Snapshots for sub-millisecond cold start (depends on Boa snapshots)
+- Single-file binaries via `x8 compile` (à la Bun) — requires a
+  self-extracting binary format
+- Pre-built release binaries on GitHub Releases (needs CI setup)
+- Crates.io publication (needs API token)
+- Source maps for v1.2 transpilation
 
 ---
 

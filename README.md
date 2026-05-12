@@ -55,7 +55,17 @@ cargo install --path .
 ### Run a script
 
 ```sh
-x8 hello.js
+x8 --allow-read script.js
+# or grant everything (matches v1.x behavior):
+x8 --allow-all script.js
+```
+
+Since v2.0, x8 starts with **all capabilities denied**. Add
+`--allow-read`, `--allow-write`, `--allow-net`, `--allow-run`, or
+`--allow-all` to grant what your script needs.
+
+```sh
+x8 hello.js  # works for scripts that only use console.log etc.
 ```
 
 ```js
@@ -92,6 +102,49 @@ x8 myscript.js -- foo bar baz
 console.log("got:", args);
 // got: foo,bar,baz
 ```
+
+## Subcommands
+
+### `x8 test [paths...]`
+
+Discovers `*.test.{ts,js}` and `*.spec.{ts,js}` files recursively
+under the given paths (current directory if no paths are given) and
+runs each. Inside test files, three globals are provided:
+
+```ts
+test("addition works", () => {
+  assertEq(1 + 2, 3);
+});
+
+test("array map", () => {
+  const r = [1, 2, 3].map(n => n * 2);
+  assertEq(JSON.stringify(r), "[2,4,6]");
+});
+
+test("truthy", () => {
+  assert(42 > 0);
+});
+```
+
+```sh
+x8 --allow-read test ./tests
+```
+
+Exit code is the number of failures (or `0` on success).
+
+### `x8 fmt [--write] [paths...]`
+
+Re-emits source via the oxc code generator. By default prints the
+formatted output to stdout. Pass `--write` (or `-w`) to overwrite
+each file in place.
+
+```sh
+x8 fmt src/component.tsx
+x8 fmt --write src/*.ts
+```
+
+`x8 fmt` does **not** require any permission flags — it does not
+execute the parsed source.
 
 ## Built-in globals
 
@@ -249,7 +302,7 @@ deliverables, open questions, and risks for each milestone.
 | **v1.4** ✅ | Concurrency | Workers on dedicated threads |
 | **v1.5** ✅ | Permissions | Allow/deny flags, inherited by workers |
 | **v1.6** ✅ | Embedding | lib/bin split, `x8::run_cli`, public `Permissions` |
-| **v2.0** | Production | Optional V8 backend, snapshots, `x8 compile` |
+| **v2.0** ✅ | Production | Default-deny perms, `x8 test`, `x8 fmt` |
 
 ## Architecture
 

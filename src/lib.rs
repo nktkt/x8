@@ -203,7 +203,7 @@ fn perms() -> Permissions {
 fn require_perm(category: &str, ok: bool) -> JsResult<()> {
     if !ok {
         return Err(js_err(format!(
-            "permission denied: {category} (rerun without --deny-{category})"
+            "permission denied: {category} (add --allow-{category} or --allow-all)"
         )));
     }
     Ok(())
@@ -406,31 +406,41 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("    x8 [OPTIONS] [SCRIPT] [-- ARGS...]");
+    println!("    x8 [OPTIONS] test [PATHS...]");
+    println!("    x8 [OPTIONS] fmt [--write] [PATHS...]");
     println!();
     println!("OPTIONS:");
     println!("    -e, --eval <CODE>    Evaluate inline JavaScript and exit");
     println!("    -V, --version        Print version information");
     println!("    -h, --help           Print this help message");
     println!();
-    println!("PERMISSIONS (opt-in deny in v1.x, default-deny in v2.0):");
-    println!("    --allow-all          Allow all capabilities (no-op in v1.x)");
+    println!("PERMISSIONS (default-deny since v2.0):");
+    println!("    --allow-all          Allow all capabilities");
     println!("    --allow-read/write/net/env/run   Allow that capability");
-    println!("    --deny-all           Deny all capabilities");
-    println!("    --deny-read/write/net/env/run    Deny that capability");
+    println!("    --deny-all           Deny all (default)");
+    println!("    --deny-read/write/net/env/run    Subtract from --allow-all");
     println!();
     println!("EXAMPLES:");
-    println!("    x8 script.js                Run a script file");
-    println!("    x8 -e \"console.log(1+2)\"     Evaluate inline");
-    println!("    x8                          Start an interactive REPL");
+    println!("    x8 --allow-all script.js     Run a script with all perms");
+    println!("    x8 -e \"console.log(1+2)\"      Evaluate inline (no perms needed)");
+    println!("    x8                           Start an interactive REPL");
+    println!("    x8 --allow-read test ./tests");
+    println!("    x8 fmt --write src/*.ts      Format files in place");
     println!();
     println!("BUILT-IN GLOBALS:");
     println!("    console.log/error/warn/info/debug");
-    println!("    readFile(path) / writeFile(path, content)");
+    println!("    readFile(path) / writeFile(path, content)        [needs --allow-read/write]");
     println!("    setTimeout(fn, ms) / clearTimeout(id)");
     println!("    setInterval(fn, ms) / clearInterval(id)");
     println!("    queueMicrotask(fn)");
-    println!("    fetch(url, opts?) -> Promise<Response>");
+    println!("    fetch(url, opts?) -> Promise<Response>           [needs --allow-net]");
+    println!("    Worker(scriptPath) / self.postMessage            [needs --allow-run]");
     println!("    args, exit(code), x8.version");
+    println!();
+    println!("TEST GLOBALS (when running `x8 test`):");
+    println!("    test(name, fn)       Register a test case");
+    println!("    assert(value, msg?)  Throw if value is falsy");
+    println!("    assertEq(a, b)       Throw if a !== b");
 }
 
 // ============================================================================
@@ -1422,8 +1432,230 @@ fn run_repl(ctx: &mut Context) -> ExitCode {
 }
 
 // ============================================================================
+// Subcommands: `x8 test` and `x8 fmt`
+// ============================================================================
+
+fn cmd_fmt(paths: Vec<String>, write: bool) -> ExitCode {
+    use oxc_allocator::Allocator;
+    use oxc_codegen::Codegen;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    if paths.is_empty() {
+        eprintln!("{NAME}: fmt: no files given");
+        return ExitCode::from(2);
+    }
+    let mut had_error = false;
+    for path_str in paths {
+        let path = Path::new(&path_str);
+        let source = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{NAME}: fmt {}: {e}", path.display());
+                had_error = true;
+                continue;
+            }
+        };
+        let allocator = Allocator::default();
+        let source_type = SourceType::from_path(path).unwrap_or_default();
+        let parser_ret = Parser::new(&allocator, &source, source_type).parse();
+        if !parser_ret.errors.is_empty() {
+            for e in &parser_ret.errors {
+                eprintln!("{NAME}: fmt {}: {e}", path.display());
+            }
+            had_error = true;
+            continue;
+        }
+        let output = Codegen::new().build(&parser_ret.program).code;
+        if write {
+            if let Err(e) = fs::write(path, &output) {
+                eprintln!("{NAME}: fmt write {}: {e}", path.display());
+                had_error = true;
+            }
+        } else {
+            print!("{output}");
+        }
+    }
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn discover_test_files(roots: Vec<String>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let candidates = if roots.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        roots.into_iter().map(PathBuf::from).collect()
+    };
+    fn is_test_file(p: &Path) -> bool {
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        (name.ends_with(".test.js")
+            || name.ends_with(".test.ts")
+            || name.ends_with(".spec.js")
+            || name.ends_with(".spec.ts"))
+            && !name.starts_with('.')
+    }
+    fn walk(p: &Path, out: &mut Vec<PathBuf>) {
+        if p.is_file() {
+            out.push(p.to_path_buf());
+            return;
+        }
+        if p.is_dir() {
+            if let Ok(entries) = fs::read_dir(p) {
+                for e in entries.flatten() {
+                    let path = e.path();
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if name.starts_with('.') || name == "node_modules" || name == "target" {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else if is_test_file(&path) {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+    }
+    for c in candidates {
+        if c.is_file() {
+            out.push(c);
+        } else {
+            walk(&c, &mut out);
+        }
+    }
+    out.sort();
+    out
+}
+
+thread_local! {
+    static TEST_RESULTS: RefCell<TestResults> = RefCell::new(TestResults::default());
+}
+
+#[derive(Default)]
+struct TestResults {
+    passed: u32,
+    failed: u32,
+    failures: Vec<String>,
+}
+
+fn test_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args
+        .first()
+        .ok_or_else(|| js_err("test: missing name"))?
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let cb_val = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| js_err("test: missing function"))?;
+    let cb = cb_val
+        .as_callable()
+        .ok_or_else(|| js_err("test: second arg must be a function"))?
+        .clone();
+    match cb.call(&JsValue::undefined(), &[], ctx) {
+        Ok(_) => {
+            println!("  \u{2713} {name}");
+            TEST_RESULTS.with(|r| r.borrow_mut().passed += 1);
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            println!("  \u{2717} {name}");
+            println!("      {msg}");
+            TEST_RESULTS.with(|r| {
+                let mut r = r.borrow_mut();
+                r.failed += 1;
+                r.failures.push(format!("{name}: {msg}"));
+            });
+        }
+    }
+    Ok(JsValue::undefined())
+}
+
+fn assert_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let v = args.first().cloned().unwrap_or(JsValue::undefined());
+    if !v.to_boolean() {
+        let msg = args
+            .get(1)
+            .map(|m| m.to_string(ctx))
+            .transpose()?
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_else(|| "assertion failed".to_string());
+        return Err(js_err(msg));
+    }
+    Ok(JsValue::undefined())
+}
+
+fn assert_eq_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let a = args.first().cloned().unwrap_or(JsValue::undefined());
+    let b = args.get(1).cloned().unwrap_or(JsValue::undefined());
+    let a_str = format_value(&a, ctx);
+    let b_str = format_value(&b, ctx);
+    if a_str != b_str {
+        return Err(js_err(format!("assertEq: expected {b_str}, got {a_str}")));
+    }
+    Ok(JsValue::undefined())
+}
+
+fn register_test_globals(ctx: &mut Context) -> JsResult<()> {
+    ctx.register_global_callable(
+        js_string!("test"),
+        2,
+        NativeFunction::from_fn_ptr(test_native),
+    )?;
+    ctx.register_global_callable(
+        js_string!("assert"),
+        2,
+        NativeFunction::from_fn_ptr(assert_native),
+    )?;
+    ctx.register_global_callable(
+        js_string!("assertEq"),
+        2,
+        NativeFunction::from_fn_ptr(assert_eq_native),
+    )?;
+    Ok(())
+}
+
+fn cmd_test(paths: Vec<String>, ctx: &mut Context) -> ExitCode {
+    let files = discover_test_files(paths);
+    if files.is_empty() {
+        eprintln!("{NAME}: test: no matching files");
+        return ExitCode::from(2);
+    }
+    if let Err(e) = register_test_globals(ctx) {
+        eprintln!("{NAME}: test: failed to register globals: {e}");
+        return ExitCode::from(1);
+    }
+    TEST_RESULTS.with(|r| *r.borrow_mut() = TestResults::default());
+
+    for file in &files {
+        println!("\n{}", file.display());
+        let _ = run_file(file, ctx);
+    }
+
+    let (passed, failed) = TEST_RESULTS.with(|r| {
+        let r = r.borrow();
+        (r.passed, r.failed)
+    });
+    println!("\n{passed} passed, {failed} failed ({} files)", files.len());
+    if failed > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+// ============================================================================
 // Arg parsing
 // ============================================================================
+
+enum Subcommand {
+    Test { paths: Vec<String> },
+    Fmt { paths: Vec<String>, write: bool },
+}
 
 #[derive(Default)]
 struct ParsedArgs {
@@ -1434,12 +1666,12 @@ struct ParsedArgs {
     script_args: Vec<String>,
     error: Option<String>,
     permissions: Option<Permissions>,
+    subcommand: Option<Subcommand>,
 }
 
 fn parse_args(argv: Vec<String>) -> ParsedArgs {
     let mut out = ParsedArgs::default();
-    let mut perms = Permissions::all_allowed();
-    let mut perms_touched = false;
+    let mut perms = Permissions::all_denied();
     let mut iter = argv.into_iter().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1452,41 +1684,35 @@ fn parse_args(argv: Vec<String>) -> ParsedArgs {
                     return out;
                 }
             },
-            // Permission flags. In v1.x, default is allow-all; --deny-* subtracts.
-            "--allow-all" | "--allow-read" | "--allow-write" | "--allow-net"
-            | "--allow-env" | "--allow-run" => {
-                perms_touched = true;
-                // No-op in v1.x: default already allows everything.
+            "--allow-all" => perms = Permissions::all_allowed(),
+            "--allow-read" => perms.read = true,
+            "--allow-write" => perms.write = true,
+            "--allow-net" => perms.net = true,
+            "--allow-env" => perms.env = true,
+            "--allow-run" => perms.run = true,
+            "--deny-all" => perms = Permissions::all_denied(),
+            "--deny-read" => perms.read = false,
+            "--deny-write" => perms.write = false,
+            "--deny-net" => perms.net = false,
+            "--deny-env" => perms.env = false,
+            "--deny-run" => perms.run = false,
+            "test" if out.subcommand.is_none() && out.script.is_none() => {
+                let paths: Vec<String> = iter.by_ref().collect();
+                out.subcommand = Some(Subcommand::Test { paths });
+                break;
             }
-            "--deny-all" => {
-                perms = Permissions {
-                    read: false,
-                    write: false,
-                    net: false,
-                    env: false,
-                    run: false,
-                };
-                perms_touched = true;
-            }
-            "--deny-read" => {
-                perms.read = false;
-                perms_touched = true;
-            }
-            "--deny-write" => {
-                perms.write = false;
-                perms_touched = true;
-            }
-            "--deny-net" => {
-                perms.net = false;
-                perms_touched = true;
-            }
-            "--deny-env" => {
-                perms.env = false;
-                perms_touched = true;
-            }
-            "--deny-run" => {
-                perms.run = false;
-                perms_touched = true;
+            "fmt" if out.subcommand.is_none() && out.script.is_none() => {
+                let mut paths = Vec::new();
+                let mut write = false;
+                for a in iter.by_ref() {
+                    if a == "--write" || a == "-w" {
+                        write = true;
+                    } else {
+                        paths.push(a);
+                    }
+                }
+                out.subcommand = Some(Subcommand::Fmt { paths, write });
+                break;
             }
             "--" => {
                 out.script_args.extend(iter.by_ref());
@@ -1503,9 +1729,7 @@ fn parse_args(argv: Vec<String>) -> ParsedArgs {
             }
         }
     }
-    if perms_touched {
-        out.permissions = Some(perms);
-    }
+    out.permissions = Some(perms);
     out
 }
 
@@ -1533,6 +1757,10 @@ pub fn run_cli(args: Vec<String>) -> ExitCode {
     if parsed.show_version {
         println!("{NAME} {VERSION}");
         return ExitCode::SUCCESS;
+    }
+    // `x8 fmt` does not need a JS runtime, handle it early.
+    if let Some(Subcommand::Fmt { paths, write }) = parsed.subcommand.as_ref() {
+        return cmd_fmt(paths.clone(), *write);
     }
 
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1570,6 +1798,9 @@ pub fn run_cli(args: Vec<String>) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    if let Some(Subcommand::Test { paths }) = parsed.subcommand {
+        return cmd_test(paths, &mut ctx);
+    }
     if let Some(code) = parsed.eval_code {
         return run_source(&code, "[eval]", &mut ctx);
     }
